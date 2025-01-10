@@ -1,0 +1,78 @@
+# Xcode
+.DS_Store
+*/.DS_Store
+xcuserdata/
+*.xcscmblueprint
+*.xccheckout
+*.xcuserstate
+DerivedData/
+build/
+
+# macOS
+*.swp
+*.lock
+*.log
+*.tmp
+*.bak
+Thumbs.db
+
+# Swift Package Manager
+/.build/
+/Packages/
+/.swiftpm/
+*.xcodeproj/project.xcworkspace/
+*.xcodeproj/xcuserdata/
+*.xcodeproj/xcshareddata/swiftpm/
+
+# Cocoapods
+Pods/
+Podfile.lock
+Manifest.lock
+
+# Carthage
+Carthage/Build/
+
+# Fastlane
+fastlane/report.xml
+fastlane/Preview.html
+fastlane/screenshots/
+fastlane/test_output/
+
+# Temporary files
+*.moved-aside
+*.hmap
+*.ipa
+*.dSYM.zip
+*.dSYM
+
+# App-specific files
+*.xcworkspace/
+# *.plist
+
+# Logs and databases
+*.db
+*.sqlite
+*.sqlite3
+*.coredata
+
+# SwiftLint
+.swiftlint.yml
+
+# Periphery
+.periphery.yml
+
+# Playground
+timeline.xctimeline
+playground.xcworkspace
+
+# Archives
+*.xcarchive
+
+# Unit test output
+test-results/
+
+# Code Coverage
+*.xcresult
+
+# Custom exclusion (if needed)
+Secrets.xcconfig
