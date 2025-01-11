@@ -1,7 +1,7 @@
 # Yogurt
 
 <p align="center">
-  <img width="600" alt="yogurt-screenshot" src="https://github.com/user-attachments/assets/2ebe9f0f-371d-4418-9bdc-6cfa2ee02ee8">
+  <img width="600" alt="yogurt-screenshot" src="https://github.com/user-attachments/assets/ae8b516b-72dd-4928-b3d7-f07b111c0e39">
 </p>
 
 Yogurt is a macOS notes app that enhances meeting notes by capturing and transcribing both system audio and microphone input. Audio processing and note enhancement is powered by [Cloudflare Workers AI](https://developers.cloudflare.com/workers-ai/).
