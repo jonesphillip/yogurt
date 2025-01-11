@@ -154,7 +154,7 @@ struct ContentView: View {
       .padding(.top, 32)
       .padding(.leading, 8)
       .padding(.bottom, 30)
-      .background(Color.white)
+      .background(Color(NSColor.textBackgroundColor))
       .edgesIgnoringSafeArea(.all)
   }
 
@@ -169,7 +169,8 @@ struct ContentView: View {
     }
     .padding(.top, 62)
     .padding(.leading, 12)
-    .background(Color.white)
+    .padding(.trailing, 12)
+    .background(Color(NSColor.textBackgroundColor))
     .edgesIgnoringSafeArea(.all)
     .overlay(scannerBarOverlay)
   }
@@ -436,7 +437,7 @@ struct ContentView: View {
       ZStack(alignment: .topLeading) {
         // Main scanner/morphing bar
         HStack(spacing: 12) {
-          if !isMorphingToControls || morphProgress < 0.5 {
+          if !isMorphingToControls {
             ProgressToCheckmark(
               progress: progressValue,
               showCheckmark: showCheckmark
@@ -486,14 +487,16 @@ struct ContentView: View {
           y: currentYOffset)
 
         // Fade in recording controls
-        if isMorphingToControls && morphProgress > 0.5 {
-          HStack {
+        if isMorphingToControls {
+          HStack(spacing: 12) {
             Button(action: {}) {
               Image(systemName: "circle.fill")
                 .font(.system(size: 14, weight: .bold))
                 .foregroundColor(.white)
             }
             .buttonStyle(.plain)
+            .padding(.leading, 14)
+            .padding(.trailing, 7)
 
             Button(action: {}) {
               Image(systemName: "square.fill")
@@ -501,8 +504,13 @@ struct ContentView: View {
                 .foregroundColor(.white)
             }
             .buttonStyle(.plain)
+            .padding(.horizontal, 7)
           }
-          .opacity(Double(max(0, (morphProgress * 2 - 1))))  // Start fading in at 50%
+          .opacity(Double(morphProgress))
+          .offset(
+            x: mix(8, (geo.size.width - endWidth) / 2 + 10, progress: morphProgress),
+            y: currentYOffset + (currentHeight - endHeight) / 2
+          )
         }
       }
       .animation(.easeInOut(duration: 0.3), value: scanningIndex)

@@ -26,6 +26,7 @@ class MarkdownStorage: NSTextStorage {
     self.currentFontSize = fontSize
     self.markdownParser = MarkdownParser(fontSize: fontSize)
     super.init()
+    setupAppearanceObserver()
   }
 
   required init?(coder: NSCoder) {
@@ -39,6 +40,19 @@ class MarkdownStorage: NSTextStorage {
   required init(pasteboardPropertyList propertyList: Any, ofType type: NSPasteboard.PasteboardType)
   {
     fatalError("init(pasteboardPropertyList:ofType:) has not been implemented")
+  }
+
+  private func setupAppearanceObserver() {
+    NotificationCenter.default.addObserver(
+      self,
+      selector: #selector(handleAppearanceChange),
+      name: NSApplication.didChangeScreenParametersNotification,
+      object: nil
+    )
+  }
+
+  @objc private func handleAppearanceChange() {
+    refreshStyles()
   }
 
   // MARK: - NSTextStorage Override Methods

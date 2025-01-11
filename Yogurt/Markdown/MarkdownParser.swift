@@ -221,10 +221,15 @@ struct MarkdownStylizer: MarkupWalker {
       let nsRange = NSRange(range, in: text)
       let adjustedRange = NSRange(location: nsRange.location + baseRange, length: nsRange.length)
 
+      let isDarkMode = NSApp.effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+      let backgroundColor =
+        isDarkMode
+        ? NSColor.textColor.withAlphaComponent(0.2) : NSColor.textColor.withAlphaComponent(0.1)
+
       textStorage.addAttributes(
         [
           .font: monospaceFont,
-          .backgroundColor: NSColor.textColor.withAlphaComponent(0.1),
+          .backgroundColor: backgroundColor,
         ], range: adjustedRange)
 
       searchRange.location = nsRange.upperBound
@@ -252,10 +257,15 @@ struct MarkdownStylizer: MarkupWalker {
       paragraphStyle.headIndent = TextStyle.listIndent
       paragraphStyle.firstLineHeadIndent = TextStyle.listIndent
 
+      let isDarkMode = NSApp.effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+      let backgroundColor =
+        isDarkMode
+        ? NSColor.textColor.withAlphaComponent(0.2) : NSColor.textColor.withAlphaComponent(0.1)
+
       textStorage.addAttributes(
         [
           .font: monospaceFont,
-          .backgroundColor: NSColor.textColor.withAlphaComponent(0.1),
+          .backgroundColor: backgroundColor,
           .paragraphStyle: paragraphStyle,
         ], range: adjustedRange)
 
