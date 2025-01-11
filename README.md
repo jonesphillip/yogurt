@@ -13,6 +13,13 @@ This respository contains the source code for the macOS app. You'll need to depl
 
 Heavily inspired by [Granola](https://www.granola.ai/).
 
+## Installation
+You can either:
+- [Download the latest release](https://github.com/jonesphillip/yogurt/releases/latest)
+- Or build from source (see [Development](#development) below)
+
+On first launch, you'll need to configure your Cloudflare Worker URL in the settings.
+
 ## Features
 - Markdown support (including headings, lists, inline code blocks, and more)
 - Audio capture
@@ -28,7 +35,7 @@ Heavily inspired by [Granola](https://www.granola.ai/).
 
 Yogurt supports macOS v14.4 or later. You'll need Xcode 15.0 or later to develop.
 
-## How to build and run Yogurt
+## Development
 
 1. Clone the repository:
    ```bash
@@ -42,8 +49,6 @@ Yogurt supports macOS v14.4 or later. You'll need Xcode 15.0 or later to develop
    ```
 
 3. Build and run the project (⌘R)
-
-4. On first launch, you'll need to configure your Cloudflare Worker URL in the settings.
 
 ## Cloudflare Worker configuration
 
