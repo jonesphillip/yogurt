@@ -755,7 +755,6 @@ struct ContentView: View {
       }
 
       let (_, content) = try NoteManager.shared.getNote(withId: note.id)
-      guard !content.isEmpty else { return }
       guard let baseURL = CloudflareService.shared.getWorkerURL(),
         let url = URL(string: "enhance", relativeTo: baseURL)
       else {
