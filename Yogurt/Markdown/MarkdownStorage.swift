@@ -8,9 +8,6 @@ class MarkdownStorage: NSTextStorage {
   // Parser for markdown styling
   private var markdownParser: MarkdownParser
 
-  // Current font size
-  private var currentFontSize: CGFloat
-
   // Debouncer for style updates
   private var updateTimer: Timer?
   private let updateDelay: TimeInterval = 0.1
@@ -23,7 +20,6 @@ class MarkdownStorage: NSTextStorage {
   }
 
   init(fontSize: CGFloat = TextStyle.baseFontSize) {
-    self.currentFontSize = fontSize
     self.markdownParser = MarkdownParser(fontSize: fontSize)
     super.init()
     setupAppearanceObserver()
@@ -31,10 +27,6 @@ class MarkdownStorage: NSTextStorage {
 
   required init?(coder: NSCoder) {
     fatalError("init(coder:) has not been implemented")
-  }
-
-  required init(itemProviderData data: Data, typeIdentifier: String) throws {
-    fatalError("init(itemProviderData:typeIdentifier:) has not been implemented")
   }
 
   required init(pasteboardPropertyList propertyList: Any, ofType type: NSPasteboard.PasteboardType)
@@ -97,7 +89,6 @@ class MarkdownStorage: NSTextStorage {
   // MARK: - Style Management
 
   func updateFontSize(_ newSize: CGFloat) {
-    currentFontSize = newSize
     markdownParser.updateFontSize(newSize)
     refreshStyles()
   }

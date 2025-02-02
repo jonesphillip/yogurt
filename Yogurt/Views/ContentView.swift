@@ -2,60 +2,146 @@ import AVFoundation
 import OSLog
 import SwiftUI
 
+class ViewState: ObservableObject {
+  @Published var errorState = ErrorState()
+}
+
+enum EnhancementStep: Int, CaseIterable {
+  case idle = 0
+  case transcribingNotes = 1
+  case findingEmphasis = 2
+  case extractingActions = 3
+  case enhancing = 4
+
+  var displayName: String {
+    switch self {
+    case .idle: return "Idle"
+    case .transcribingNotes: return "1. Create Transcript Notes"
+    case .findingEmphasis: return "2. Find Points of Emphasis"
+    case .extractingActions: return "3. Extract Actions"
+    case .enhancing: return "4. Generate Enhanced Notes"
+    }
+  }
+
+  var shortName: String {
+    switch self {
+    case .idle: return "Idle"
+    case .transcribingNotes: return "Trans"
+    case .findingEmphasis: return "Emph"
+    case .extractingActions: return "Act"
+    case .enhancing: return "Gen"
+    }
+  }
+}
+
+struct EnhancementProgress {
+  var transcriptionNotes: String = ""
+  var pointsOfEmphasis: String = ""
+  var actionItems: String = ""
+}
+
 struct ContentView: View {
 
+  // MARK: - Audio & Recording
   @State private var recordingPermission = RecordingPermission()
   @State private var audioManager = AudioSourceManager()
   @State var transcriber: ProcessTapRecorder? = nil
   @State private var micRecorder = MicrophoneRecorder()
 
+  // MARK: - Model & Services
   @StateObject private var noteManager = NoteManager.shared
   @StateObject private var cloudflareService = CloudflareService.shared
+  @StateObject private var viewState = ViewState()
   private let fileManager = NoteFileManager.shared
 
+  // MARK: - Note Selection
   @State private var selectedNote: Note?
   @State private var notes: [Note] = []
 
+  // MARK: - Text Editor
   @State var typedNotes = ""
   @State var transcript = ""
   @State var isRecording = false
   @State private var lastSavedContent: String = ""
-
-  @State private var recordingTargetNote: Note?
-  @State var isEnhancing = false
-
   @State private var textViewRef = TextViewReference()
 
+  // Currently active note for recording
+  @State private var recordingTargetNote: Note?
+  // Currently enhancing note (may be different from selected note)
+  @State private var enhancementTargetNote: Note?
+
+  // MARK: - Enhancement
+  @State var isEnhancing = false
   @State private var enhancedLines: [String] = []
   @State private var originalLines: [String] = []
   @State private var currentLineBuffer: String = ""
   @State private var scanningIndex: Int = 0
   @State private var isDone: Bool = false
   @State private var lastCompletedIndex: Int = -1
-
   @State private var textHeights: [Int: CGFloat] = [:]
   @State private var currentLineHeight: CGFloat = 0
-  @State private var currentSidebarWidth: CGFloat = 250
-
   @State private var progressValue: CGFloat = 0.0
   @State private var showCheckmark = false
   @State private var isMorphingToControls = false
   @State private var morphProgress: CGFloat = 0
+  @State private var enhancementStep: EnhancementStep = .idle
 
+  // MARK: - Versions
+  @State private var viewingVersionContent: String?
+  @State private var selectedVersion: NoteVersion?
+  @State private var versionsForCurrentNote: [NoteVersion] = []
+
+  private var combinedAmplitude: Float {
+    // Combine mic + system amplitude
+    let boostedMic = micRecorder.amplitude * 1.65
+    return max(boostedMic, transcriber?.amplitude ?? 0)
+  }
+
+  // MARK: - Other
+  let debugManager = DebugManager.shared
   let logger = Logger(subsystem: kAppSubsystem, category: "ContentView")
   private let browserFinder = DefaultBrowserFinder()
+
+  // Timer for auto-saving typed notes
   private let autoSaveTimer = Timer.publish(every: 0.5, on: .main, in: .common).autoconnect()
   @State private var lastSaveTimestamp: Date = Date()
   @State private var hasPendingChanges: Bool = false
   private let minTimeBetweenSaves: TimeInterval = 1.0
 
+  // Layout styling
+  @State private var currentSidebarWidth: CGFloat = 250
   let fontSize: CGFloat = 16
   let horizontalPadding: CGFloat = 12
   let verticalPadding: CGFloat = 0.2
 
+  private var isViewingPastVersion: Bool {
+    viewingVersionContent != nil || selectedVersion != nil
+  }
+
+  private var shouldDisableVersionSelector: Bool {
+    isRecording || enhancementTargetNote != nil
+  }
+
+  // Disable recording controls if ANY note is being enhanced or if another note is active
+  private var shouldDisableRecordingControlsForSelectedNote: Bool {
+    // If ANY note is being enhanced, disable all recording controls
+    if enhancementTargetNote != nil {
+      return true
+    }
+
+    guard let sel = selectedNote else { return true }
+    if let activeNote = noteManager.notes.first(where: { $0.isRecording || $0.hasPendingTranscript }
+    ) {
+      return activeNote.id != sel.id
+    }
+    return false
+  }
+
+  // MARK: - Body
   var body: some View {
     HSplitView {
-      SidebarView(selectedNote: $selectedNote)
+      // Sidebar
+      SidebarView(selectedNote: $selectedNote, combinedAmplitude: combinedAmplitude)
         .frame(minWidth: 250, idealWidth: 250, maxWidth: 450)
         .layoutPriority(1)
         .background(
@@ -64,11 +150,11 @@ struct ContentView: View {
           }
         )
 
+      // Main content
       GeometryReader { mainGeometry in
         ZStack {
           if let note = selectedNote {
             mainContentView(geometry: mainGeometry)
-            controlsOverlay
           }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -76,11 +162,14 @@ struct ContentView: View {
       }
       .layoutPriority(2)
     }
+    // Toolbar items
     .toolbar {
-      ToolbarItem(placement: .primaryAction) {
+      // Left side: new note / delete note
+      ToolbarItemGroup(placement: .primaryAction) {
         HStack(spacing: 16) {
           Spacer()
             .frame(width: currentSidebarWidth - 200)
+
           Button(action: createNewNote) {
             Image(systemName: "square.and.pencil")
               .font(.system(size: 12))
@@ -102,33 +191,48 @@ struct ContentView: View {
           }
         }
       }
-    }
-    .onReceive(noteManager.$notes) { updatedNotes in
-      notes = updatedNotes.map { note in
-        var noteCopy = note
-        // Preserve recording/enhancing states from existing notes
-        if let existingNote = notes.first(where: { $0.id == note.id }) {
-          noteCopy.isRecording = existingNote.isRecording
-          noteCopy.isEnhancing = existingNote.isEnhancing
+
+      // Right side: version selector
+      ToolbarItemGroup(placement: .automatic) {
+        Spacer()
+        if let note = selectedNote {
+          VersionSelectorView(
+            versions: versionsForCurrentNote,
+            onVersionSelect: { version in
+              switchToVersion(version)
+            },
+            onApplyVersion: { version in
+              applyVersion(version)
+            },
+            noteId: note.id
+          )
+          .disabled(shouldDisableVersionSelector)
         }
-        return noteCopy
       }
+    }
+    // Keep local `notes` in sync with the manager
+    .onReceive(noteManager.$notes) { updatedNotes in
+      notes = updatedNotes
     }
     .onChange(of: selectedNote) { oldNote, newNote in
-      if let previousNote = oldNote {
-        saveNoteContent(previousNote, content: typedNotes)
+      if let prev = oldNote {
+        saveNoteContent(prev, content: typedNotes)
       }
       loadSelectedNote()
+
+      viewingVersionContent = nil
+      selectedVersion = nil
+      updateVersionsForCurrentNote()
+
       DispatchQueue.main.async {
         textViewRef.textView?.forceStyleText()
       }
     }
     .onAppear {
       audioManager.loadAvailableSources()
-
       if selectedNote == nil {
-        let notes = NoteManager.shared.getAllNotes()
-        selectedNote = notes.first
+        let all = noteManager.getAllNotes()
+        selectedNote = all.first
       }
     }
     .onReceive(autoSaveTimer) { _ in
@@ -137,16 +241,77 @@ struct ContentView: View {
     }
   }
 
-  // MARK: - Main Content Views
-
+  // MARK: - Main Content
   private func mainContentView(geometry: GeometryProxy) -> some View {
-    Group {
-      if !isEnhancing {
-        editorView
-      } else {
-        enhancedContentView(width: geometry.size.width)
+    ZStack {
+      if let note = selectedNote {
+        VStack(spacing: 0) {
+          if !isEnhancing || note.id != enhancementTargetNote?.id {
+            if let versionContent = viewingVersionContent {
+              // Past version read-only
+              ScrollView {
+                Text(versionContent)
+                  .font(.system(size: 16))
+                  .frame(maxWidth: .infinity, alignment: .leading)
+                  .padding()
+              }
+            } else {
+              // Editable text
+              editorView
+            }
+          } else {
+            // Enhancement UI - only show if this note is the target of enhancement
+            EnhancementScannerView(
+              width: geometry.size.width,
+              originalLines: $originalLines,
+              enhancedLines: $enhancedLines,
+              currentLineBuffer: $currentLineBuffer,
+              scanningIndex: $scanningIndex,
+              isDone: $isDone,
+              lastCompletedIndex: $lastCompletedIndex,
+              textHeights: $textHeights,
+              currentLineHeight: $currentLineHeight,
+              progressValue: $progressValue,
+              showCheckmark: $showCheckmark,
+              isMorphingToControls: $isMorphingToControls,
+              morphProgress: $morphProgress,
+              enhancementStep: enhancementStep,
+              fontSize: fontSize,
+              horizontalPadding: horizontalPadding,
+              verticalPadding: verticalPadding,
+              isEnhancing: $isEnhancing
+            )
+          }
+        }
+
+        // Floating bottom controls
+        VStack {
+          Spacer()
+          HStack {
+            Spacer()
+            VStack(spacing: 12) {
+              if viewState.errorState.isVisible {
+                ErrorBanner(
+                  message: viewState.errorState.message,
+                  retryCount: viewState.errorState.retryCount,
+                  maxRetries: viewState.errorState.maxRetries,
+                  isVisible: Binding(
+                    get: { viewState.errorState.isVisible },
+                    set: { viewState.errorState.isVisible = $0 }
+                  )
+                )
+                .transition(.move(edge: .bottom).combined(with: .opacity))
+              }
+
+              unifiedControls
+            }
+            Spacer()
+          }
+        }
       }
     }
+    .frame(maxWidth: .infinity, maxHeight: .infinity)
+    .background(Color(NSColor.textBackgroundColor))
   }
 
   private var editorView: some View {
@@ -158,102 +323,131 @@ struct ContentView: View {
       .edgesIgnoringSafeArea(.all)
   }
 
-  private func enhancedContentView(width: CGFloat) -> some View {
-    ScrollView {
-      VStack(alignment: .leading, spacing: 0) {
-        ForEach(0..<max(originalLines.count, enhancedLines.count), id: \.self) { idx in
-          lineView(for: idx, maxWidth: width)
+  // MARK: - Unified Controls (Recording + Enhance + Discard)
+  private var unifiedControls: some View {
+    // (Record/Stop + Audio Selector) and the optional Enhance/Discard group.
+    HStack(spacing: 12) {
+      // --- Left block: Recording controls ---
+      HStack(spacing: 8) {
+        recordStopGroup
+        audioSourceDivider
+      }
+      .frame(height: 44)
+      .padding(.horizontal, 10)
+      .background(Color.gray.opacity(0.6))
+      .cornerRadius(22)
+
+      // --- Right block (Enhance & Discard) ---
+      if let note = selectedNote,
+        note.hasPendingTranscript && !isRecording && recordingTargetNote != nil
+      {
+        HStack(spacing: 8) {
+          // Enhance
+          Button {
+            if let note = recordingTargetNote {
+              streamEnhanceNotes(forNote: note)
+            }
+          } label: {
+            HStack(spacing: 6) {
+              Image(systemName: "wand.and.stars")
+                .font(.system(size: 14, weight: .semibold))
+              Text("Enhance")
+                .font(.system(size: 12, weight: .medium))
+            }
+            .foregroundColor(.white)
+            .frame(height: 36)
+            .padding(.horizontal, 12)
+            .background(
+              LinearGradient(
+                gradient: Gradient(colors: [
+                  Color.orange.opacity(0.7),
+                  Color.orange.opacity(0.9),
+                ]),
+                startPoint: .leading,
+                endPoint: .trailing
+              )
+            )
+            .cornerRadius(16)
+          }
+          .buttonStyle(.plain)
+
+          // Discard
+          Button {
+            discardTranscript()
+          } label: {
+            HStack(spacing: 6) {
+              Image(systemName: "trash")
+                .font(.system(size: 14, weight: .medium))
+              Text("Discard")
+                .font(.system(size: 12, weight: .medium))
+            }
+            .foregroundColor(.red.opacity(0.8))
+            .frame(height: 36)
+            .padding(.horizontal, 12)
+            .background(Color.red.opacity(0.1))
+            .cornerRadius(16)
+          }
+          .buttonStyle(.plain)
+          .help("Discard current recording transcript")
         }
-        Spacer(minLength: 30)
+        .transition(
+          .asymmetric(
+            insertion: .move(edge: .trailing)
+              .combined(with: .scale(scale: 0.95))
+              .combined(with: .opacity),
+            removal: .move(edge: .trailing)
+              .combined(with: .scale(scale: 0.95))
+              .combined(with: .opacity)
+          )
+        )
       }
     }
-    .padding(.top, 62)
-    .padding(.leading, 12)
-    .padding(.trailing, 12)
-    .background(Color(NSColor.textBackgroundColor))
-    .edgesIgnoringSafeArea(.all)
-    .overlay(scannerBarOverlay)
-  }
-
-  private func lineView(for idx: Int, maxWidth: CGFloat) -> some View {
-    Group {
-      if idx <= lastCompletedIndex && idx < enhancedLines.count {
-        completedLineView(text: enhancedLines[idx], index: idx, maxWidth: maxWidth)
-      } else if idx < originalLines.count {
-        pendingLineView(text: originalLines[idx], index: idx, maxWidth: maxWidth)
-      }
-    }
-  }
-
-  private func completedLineView(text: String, index: Int, maxWidth: CGFloat) -> some View {
-    TextMeasurementView(
-      text: text,
-      fontSize: fontSize,
-      maxWidth: maxWidth - horizontalPadding * 2,
-      onHeightChange: { height in
-        textHeights[index] = height
-      }
+    .animation(
+      .easeInOut(duration: 0.3),
+      value: selectedNote?.hasPendingTranscript == true
+        && !isRecording
+        && recordingTargetNote != nil
     )
-    .padding(.leading, horizontalPadding)
-    .padding(.vertical, verticalPadding)
-    .transition(.opacity)
-  }
-
-  private func pendingLineView(text: String, index: Int, maxWidth: CGFloat) -> some View {
-    TextMeasurementView(
-      text: text,
-      fontSize: fontSize,
-      maxWidth: maxWidth - horizontalPadding * 2,
-      onHeightChange: { height in
-        if index == scanningIndex {
-          currentLineHeight = height
-        }
-        textHeights[index] = height
-      }
+    .padding(.bottom, 24)
+    .disabled(
+      !cloudflareService.isConfigured
+        || isViewingPastVersion
+        || shouldDisableRecordingControlsForSelectedNote
     )
-    .padding(.leading, horizontalPadding)
-    .padding(.vertical, verticalPadding)
-    .foregroundColor(.gray)
-    .opacity(index == scanningIndex ? 0 : 1)
   }
 
-  private var controlsOverlay: some View {
-    VStack {
-      Spacer()
-      HStack {
-        Spacer()
-        recordingControls
-        Spacer()
-      }
-    }
-  }
-
-  private var recordingControls: some View {
+  private var recordStopGroup: some View {
     HStack(spacing: 0) {
       recordButton
       stopButton
+    }
+  }
+
+  private var audioSourceDivider: some View {
+    Group {
       if !isRecording {
-        audioSourceControls
-      } else {
-        Spacer().frame(width: 9, height: 0)
+        // Only show audio selection if not recording
+        Divider()
+          .frame(width: 1, height: 25)
+          .background(Color.white.opacity(0.8))
+
+        AudioSourceSelectorView(audioManager: audioManager) { source in
+          audioManager.setSelection(source: source)
+        }
+        .frame(width: 28, height: 22)
+        .padding(.leading, 4)
+        .padding(.trailing, 9)
       }
     }
-    .background(Color.gray.opacity(0.6))
-    .cornerRadius(29)
-    .padding(.bottom, 16)
-    .disabled(!cloudflareService.isConfigured)
-    .opacity(cloudflareService.isConfigured ? 1.0 : 0.5)
   }
 
   private var recordButton: some View {
-    Button(action: {
-      Task {
-        await startRecording()
-      }
-    }) {
+    Button {
+      Task { await startRecording() }
+    } label: {
       if isRecording {
-        AudioWaveformIndicator(isSelected: true)
-          .frame(width: 29, height: 19)
+        AudioWaveformIndicator(amplitude: combinedAmplitude, isSelected: true)
+          .frame(width: 28, height: 18)
       } else {
         Image(systemName: "circle.fill")
           .font(.system(size: 14, weight: .bold))
@@ -261,53 +455,47 @@ struct ContentView: View {
       }
     }
     .buttonStyle(.plain)
-    .padding(.leading, 14)
+    .padding(.leading, 10)
     .padding(.trailing, 7)
-    .padding(.vertical, 10)
+    .padding(.vertical, 12)
     .disabled(isRecording)
   }
 
   private var stopButton: some View {
-    Button(action: { stopRecording() }) {
+    Button {
+      stopRecording()
+    } label: {
       Image(systemName: "square.fill")
-        .font(.system(size: 19, weight: .bold))
+        .font(.system(size: 18, weight: .bold))
         .foregroundColor(.white)
     }
     .buttonStyle(.plain)
     .padding(.leading, 7)
-    .padding(.trailing, 10)
-    .padding(.vertical, 10)
+    .padding(.trailing, isRecording ? 10 : 4)
+    .padding(.vertical, 12)
     .disabled(!isRecording)
   }
 
-  private var audioSourceControls: some View {
-    HStack {
-      Divider()
-        .frame(width: 1, height: 19)
-        .background(Color.white.opacity(0.8))
-
-      AudioSourceSelectorView(
-        audioManager: audioManager,
-        onSelect: { source in
-          audioManager.setSelection(source: source)
-        }
-      )
-      .frame(width: 28, height: 19)
-      .padding(.leading, 8)
-      .padding(.trailing, 14)
-      .padding(.vertical, 10)
+  private func discardTranscript() {
+    guard let note = recordingTargetNote else { return }
+    transcript = ""
+    noteManager.clearPendingTranscript(noteId: note.id)
+    noteManager.refreshNotes()
+    if let updated = noteManager.notes.first(where: { $0.id == note.id }) {
+      selectedNote = updated
     }
+    logger.info("User discarded transcript for note \(note.id).")
   }
 
+  // MARK: - Lifecycle Helpers
   private func loadSelectedNote() {
     guard let note = selectedNote else {
       typedNotes = ""
       lastSavedContent = ""
       return
     }
-
     do {
-      let (_, content) = try NoteManager.shared.getNote(withId: note.id)
+      let (_, content) = try noteManager.getNote(withId: note.id)
       typedNotes = content
       lastSavedContent = content
     } catch {
@@ -316,39 +504,42 @@ struct ContentView: View {
   }
 
   private func createNewNote() {
-    let note = NoteManager.shared.createNote()
-    notes = NoteManager.shared.getAllNotes()
+    let note = noteManager.createNote()
+    notes = noteManager.getAllNotes()
     selectedNote = note
   }
 
+  private func deleteNote(_ note: Note) {
+    do {
+      try noteManager.deleteNote(withId: note.id)
+      notes = noteManager.getAllNotes()
+      selectedNote = notes.first
+    } catch {
+      logger.error("Failed to delete note: \(error.localizedDescription)")
+    }
+  }
+
+  // MARK: - Auto-Save
   private func saveCurrentNote() {
-    // Skip if no changes or no selected note
-    guard !typedNotes.isEmpty,
-      typedNotes != lastSavedContent,
+    guard typedNotes != lastSavedContent,
       let note = selectedNote
     else { return }
 
     let currentTime = Date()
     let timeSinceLastSave = currentTime.timeIntervalSince(lastSaveTimestamp)
-
     if timeSinceLastSave < minTimeBetweenSaves {
       hasPendingChanges = true
       return
     }
 
     do {
-      let currentStates = noteManager.notes.first(where: { $0.id == note.id })
       var noteToUpdate = note
-      if let states = currentStates {
-        noteToUpdate.isRecording = states.isRecording
-        noteToUpdate.isEnhancing = states.isEnhancing
+      if let fresh = noteManager.notes.first(where: { $0.id == note.id }) {
+        noteToUpdate.isRecording = fresh.isRecording
+        noteToUpdate.isEnhancing = fresh.isEnhancing
+        noteToUpdate.hasPendingTranscript = fresh.hasPendingTranscript
       }
 
-      logger.debug(
-        "Saving note \(noteToUpdate.id) - recording: \(noteToUpdate.isRecording), enhancing: \(noteToUpdate.isEnhancing)"
-      )
-
-      // Save the current content
       try noteManager.updateNote(noteToUpdate, withContent: typedNotes)
       lastSavedContent = typedNotes
       lastSaveTimestamp = currentTime
@@ -361,7 +552,6 @@ struct ContentView: View {
     }
   }
 
-  // Add this function to check pending changes
   private func checkPendingChanges() {
     if hasPendingChanges {
       let timeSinceLastSave = Date().timeIntervalSince(lastSaveTimestamp)
@@ -372,228 +562,118 @@ struct ContentView: View {
   }
 
   private func saveNoteContent(_ note: Note, content: String) {
-    guard !content.isEmpty else { return }
-
+    guard (try? noteManager.getNote(withId: note.id)) != nil else {
+      logger.debug("Note \(note.id) no longer exists; skipping save.")
+      return
+    }
     do {
-      let currentStates = noteManager.notes.first(where: { $0.id == note.id })
-      var noteToUpdate = note
-      if let states = currentStates {
-        noteToUpdate.isRecording = states.isRecording
-        noteToUpdate.isEnhancing = states.isEnhancing
+      var updatedNote = note
+      if let fresh = noteManager.notes.first(where: { $0.id == note.id }) {
+        updatedNote.isRecording = fresh.isRecording
+        updatedNote.isEnhancing = fresh.isEnhancing
+        updatedNote.hasPendingTranscript = fresh.hasPendingTranscript
       }
-
-      logger.debug(
-        "Saving note \(noteToUpdate.id) - recording: \(noteToUpdate.isRecording), enhancing: \(noteToUpdate.isEnhancing)"
-      )
-
-      try NoteManager.shared.updateNote(noteToUpdate, withContent: content)
+      try noteManager.updateNote(updatedNote, withContent: content)
 
       if note.id == selectedNote?.id {
         lastSavedContent = content
       }
-
-      // Refresh the notes list
-      notes = NoteManager.shared.getAllNotes()
-
-      logger.debug("Saved note: \(note.id)")
+      notes = noteManager.getAllNotes()
     } catch {
       logger.error("Save failed: \(error.localizedDescription)")
     }
   }
 
-  private func deleteNote(_ note: Note) {
+  // MARK: - Versions
+  private func updateVersionsForCurrentNote() {
+    if let noteId = selectedNote?.id,
+      let allVersions = try? fileManager.getVersions(forId: noteId)
+    {
+      versionsForCurrentNote = allVersions
+    } else {
+      versionsForCurrentNote = []
+    }
+  }
+
+  private func switchToVersion(_ version: NoteVersion?) {
+    guard let note = selectedNote else { return }
+    if let version = version {
+      do {
+        let versionContent = try noteManager.getVersionContent(version, forNote: note)
+        viewingVersionContent = versionContent
+        selectedVersion = version
+      } catch {
+        logger.error("Failed to switch version: \(error.localizedDescription)")
+      }
+    } else {
+      viewingVersionContent = nil
+      selectedVersion = nil
+    }
+  }
+
+  private func applyVersion(_ version: NoteVersion) {
+    guard let note = selectedNote else { return }
     do {
-      try NoteManager.shared.deleteNote(withId: note.id)
-      notes = NoteManager.shared.getAllNotes()
-      selectedNote = notes.first
-    } catch {
-      logger.error("Failed to delete note: \(error.localizedDescription)")
-    }
-  }
-
-  private var scannerBarOverlay: some View {
-    GeometryReader { geo in
-      let yOffset = calculateScannerYOffset()
-
-      // Final position calculation (where recording controls are)
-      let finalYOffset = geo.size.height - 60
-
-      // Interpolate between scanner position and final position
-      let currentYOffset =
-        isMorphingToControls ? mix(yOffset, finalYOffset, progress: morphProgress) : yOffset
-
-      // Interpolate width from full width to controls width
-      let startWidth = geo.size.width - 16
-      let endWidth: CGFloat = 120
-      let currentWidth =
-        isMorphingToControls ? mix(startWidth, endWidth, progress: morphProgress) : startWidth
-
-      // Interpolate height
-      let startHeight = max(currentLineHeight + 2, 30)
-      let endHeight: CGFloat = 38
-      let currentHeight =
-        isMorphingToControls ? mix(startHeight, endHeight, progress: morphProgress) : startHeight
-
-      ZStack(alignment: .topLeading) {
-        // Main scanner/morphing bar
-        HStack(spacing: 12) {
-          if !isMorphingToControls {
-            ProgressToCheckmark(
-              progress: progressValue,
-              showCheckmark: showCheckmark
-            )
-            .frame(width: 20, height: 20)
-            .padding(.leading, 16)
-
-            Spacer()
-
-            Text(isDone ? "Done! ✨" : "✨ Improving notes")
-              .foregroundColor(.white)
-              .font(.system(size: 14, weight: .semibold))
-              .padding(.trailing, 16)
-          }
-        }
-        .opacity(isMorphingToControls ? Double(1 - min(1, morphProgress * 2.5)) : 1)
-        .frame(
-          width: currentWidth,
-          height: currentHeight
-        )
-        .background(
-          ZStack {
-            // Orange gradient fading out
-            RoundedRectangle(cornerRadius: 29, style: .continuous)
-              .fill(
-                LinearGradient(
-                  gradient: Gradient(colors: [
-                    Color.orange.opacity(0.6),
-                    Color.orange.opacity(0.85),
-                  ]),
-                  startPoint: .leading,
-                  endPoint: .trailing
-                )
-              )
-              .opacity(1 - morphProgress)
-
-            // Gray background fading in
-            RoundedRectangle(cornerRadius: 29, style: .continuous)
-              .fill(Color.gray.opacity(0.6))
-              .opacity(morphProgress)
-          }
-        )
-        .shadow(color: Color.black.opacity(0.15), radius: 4, x: 0, y: 3)
-        .offset(
-          x: isMorphingToControls
-            ? mix(8, (geo.size.width - currentWidth) / 2, progress: morphProgress) : 8,
-          y: currentYOffset)
-
-        // Fade in recording controls
-        if isMorphingToControls {
-          HStack(spacing: 12) {
-            Button(action: {}) {
-              Image(systemName: "circle.fill")
-                .font(.system(size: 14, weight: .bold))
-                .foregroundColor(.white)
-            }
-            .buttonStyle(.plain)
-            .padding(.leading, 14)
-            .padding(.trailing, 7)
-
-            Button(action: {}) {
-              Image(systemName: "square.fill")
-                .font(.system(size: 19, weight: .bold))
-                .foregroundColor(.white)
-            }
-            .buttonStyle(.plain)
-            .padding(.horizontal, 7)
-          }
-          .opacity(Double(morphProgress))
-          .offset(
-            x: mix(8, (geo.size.width - endWidth) / 2 + 10, progress: morphProgress),
-            y: currentYOffset + (currentHeight - endHeight) / 2
-          )
-        }
-      }
-      .animation(.easeInOut(duration: 0.3), value: scanningIndex)
-      .animation(.easeInOut(duration: 0.3), value: currentLineHeight)
-      .animation(.easeInOut(duration: 0.6), value: morphProgress)
-    }
-  }
-
-  // Helper function to interpolate between values
-  private func mix(_ from: CGFloat, _ to: CGFloat, progress: CGFloat) -> CGFloat {
-    from * (1 - progress) + to * progress
-  }
-
-  private func calculateScannerYOffset() -> CGFloat {
-    var offset: CGFloat = -1
-
-    for idx in 0..<scanningIndex {
-      offset += textHeights[idx] ?? 0
-      offset += verticalPadding * 2
-    }
-
-    return offset
-  }
-
-  private func checkRecordingPermissions() async -> Bool {
-    logger.info("Checking recording permissions...")
-
-    if recordingPermission.areAllPermissionsGranted {
-      return true
-    }
-
-    let granted = await recordingPermission.requestAllPermissions()
-
-    if !granted {
-      if recordingPermission.microphoneStatus == .denied
-        || recordingPermission.systemAudioStatus == .denied
+      if let mostRecent = versionsForCurrentNote.max(by: { $0.timestamp < $1.timestamp }),
+        let mostRecentContent = try? noteManager.getVersionContent(mostRecent, forNote: note),
+        typedNotes != mostRecentContent
       {
-        NSWorkspace.shared.openSystemSettings()
+        _ = try noteManager.createVersion(
+          forNote: note,
+          content: typedNotes
+        )
       }
-    }
 
-    return granted
+      let versionContent = try noteManager.getVersionContent(version, forNote: note)
+      typedNotes = versionContent
+      viewingVersionContent = nil
+      selectedVersion = nil
+
+      try noteManager.updateNote(note, withContent: versionContent)
+      noteManager.refreshNotes()
+      updateVersionsForCurrentNote()
+    } catch {
+      logger.error("Failed to apply version: \(error.localizedDescription)")
+    }
   }
 
-  private func startRecording() async {
-    guard let targetNote = selectedNote else {
-      logger.error("No note selected for recording")
+  // MARK: - Recording Flow
+  func startRecording() async {
+    guard let sel = selectedNote else { return }
+
+    // If note doesn't have a partial transcript, reset transcript:
+    if !sel.hasPendingTranscript {
+      transcript = ""
+    }
+
+    // Update the note's title, record state, etc.
+    var updatedNote = sel
+    let lines = typedNotes.components(separatedBy: .newlines)
+    updatedNote.title = lines.first?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "Untitled"
+    recordingTargetNote = updatedNote
+
+    // Check permissions
+    guard await checkRecordingPermissions() else {
+      logger.error("Recording permissions denied.")
       return
     }
 
-    let lines = typedNotes.components(separatedBy: .newlines)
-    let currentTitle = lines.first?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-
-    var updatedTargetNote = targetNote
-    updatedTargetNote.title = currentTitle
-    recordingTargetNote = updatedTargetNote
-
-    logger.debug("Recording target note ID: \(recordingTargetNote?.id ?? "nil")")
+    // Mark note as recording
+    DispatchQueue.main.async {
+      self.noteManager.updateNoteStates(recordingId: updatedNote.id)
+    }
 
     do {
-      guard await checkRecordingPermissions() else {
-        logger.error("Recording permissions denied")
-        return
-      }
-
-      DispatchQueue.main.async {
-        self.noteManager.updateNoteStates(recordingId: targetNote.id)
-      }
-
+      // Start the "process" tap if user selected a process
       if let processSource = audioManager.selections.selectedProcess {
         if processSource.id == "system-audio" {
-          // Handle system-wide audio recording
-          logger.info("Creating transcriber for all system audio")
           let systemProcess = AudioProcess.systemWideAudio()
           let newTranscriber = ProcessTapRecorder(process: systemProcess) { chunkData in
             sendChunkToTranscribeEndpoint(chunkData)
           }
-
           try newTranscriber.start()
           self.transcriber = newTranscriber
         } else {
-          // Handle specific process recording
-          logger.info("Creating transcriber for process: \(processSource.name)")
           let newTranscriber = ProcessTapRecorder(
             process: AudioProcess.specificProcess(
               pid: Int32(processSource.id) ?? -1,
@@ -604,12 +684,11 @@ struct ContentView: View {
           ) { chunkData in
             sendChunkToTranscribeEndpoint(chunkData)
           }
-
           try newTranscriber.start()
           self.transcriber = newTranscriber
         }
       } else {
-        // Default browser case
+        // No specific process => default browser
         let process = try browserFinder.findDefaultBrowserProcess()
         let newTranscriber = ProcessTapRecorder(process: process) { chunkData in
           sendChunkToTranscribeEndpoint(chunkData)
@@ -618,25 +697,51 @@ struct ContentView: View {
         self.transcriber = newTranscriber
       }
 
-      // Configure selected input device if any
-      if let inputSource = audioManager.selections.selectedInput {
+      // If a real mic device was chosen, set it as default
+      if let inputSource = audioManager.selections.selectedInput,
+        inputSource.objectID.isValid
+      {
         let err = setDefaultInputDevice(inputSource.objectID)
         if err != noErr {
           logger.error("Failed to set input device: \(err)")
         }
       }
 
-      // Start microphone recording
+      // -----------------------------------------------------------------
+      // Start the MicrophoneRecorder
       try micRecorder.start { chunkData in
         sendChunkToTranscribeEndpoint(chunkData)
       }
 
       self.isRecording = true
-      logger.info("Recording started for note: \(recordingTargetNote?.id ?? "none")")
+      logger.info("Microphone recording started")
+      logger.info("Recording started for note: \(updatedNote.id)")
+
     } catch {
       logger.error("Failed to start recording: \(error.localizedDescription)")
       DispatchQueue.main.async {
         self.noteManager.clearStates()
+      }
+    }
+  }
+
+  private func stopRecording() {
+    DispatchQueue.global(qos: .userInitiated).async {
+      self.transcriber?.stop()
+      self.transcriber = nil
+      self.micRecorder.stop()
+
+      DispatchQueue.main.async {
+        self.isRecording = false
+        self.noteManager.clearStates()
+        if let note = self.recordingTargetNote {
+          self.noteManager.markPendingTranscript(noteId: note.id)
+          self.noteManager.refreshNotes()
+          if let updated = self.noteManager.notes.first(where: { $0.id == note.id }) {
+            self.selectedNote = updated
+          }
+          self.logger.info("Recording stopped. Marked note as pending transcript.")
+        }
       }
     }
   }
@@ -647,7 +752,6 @@ struct ContentView: View {
       mScope: kAudioObjectPropertyScopeGlobal,
       mElement: kAudioObjectPropertyElementMain
     )
-
     var mutableDeviceID = deviceID
     return AudioObjectSetPropertyData(
       AudioObjectID.system,
@@ -659,36 +763,11 @@ struct ContentView: View {
     )
   }
 
-  private func stopRecording() {
-    // Save pre-enhancement version before stopping recording
-    if let targetNote = recordingTargetNote {
-      do {
-        try fileManager.saveVersionedCopy(forId: targetNote.id, title: targetNote.title)
-      } catch {
-        logger.error("Failed to save pre-enhancement version: \(error.localizedDescription)")
-      }
-    }
-    transcriber?.stop()
-    transcriber = nil
-
-    micRecorder.stop()
-    isRecording = false
-    logger.info("Recording stopped")
-
-    DispatchQueue.main.async {
-      self.noteManager.clearStates()
-    }
-
-    if let targetNote = recordingTargetNote {
-      streamEnhanceNotes(forNote: targetNote)
-    }
-  }
-
   private func sendChunkToTranscribeEndpoint(_ chunk: Data) {
     guard let baseURL = CloudflareService.shared.getWorkerURL(),
       let url = URL(string: "transcribe", relativeTo: baseURL)
     else {
-      logger.error("Cloudflare Worker URL not configured")
+      logger.error("No Cloudflare Worker URL, cannot transcribe.")
       return
     }
 
@@ -697,128 +776,92 @@ struct ContentView: View {
     request.setValue("application/octet-stream", forHTTPHeaderField: "Content-Type")
     request.setValue("\(chunk.count)", forHTTPHeaderField: "Content-Length")
     request.httpBody = chunk
-
     CloudflareService.shared.prepareRequest(&request)
 
-    URLSession.shared.dataTask(with: request) { [self] data, response, error in
+    URLSession.shared.dataTask(with: request) { data, response, error in
       if let error = error {
         self.logger.error("Transcription network error: \(error.localizedDescription)")
         return
       }
-
+      guard let httpResponse = response as? HTTPURLResponse else {
+        self.logger.error("Invalid response from transcription.")
+        return
+      }
+      guard (200...299).contains(httpResponse.statusCode) else {
+        if httpResponse.statusCode == 401 || httpResponse.statusCode == 403 {
+          DispatchQueue.main.async {
+            self.viewState.errorState.show(
+              message: "Transcription authentication error. Check config."
+            )
+          }
+        }
+        self.logger.error("Transcription error: HTTP \(httpResponse.statusCode)")
+        return
+      }
       guard let data = data else {
-        self.logger.error("Transcription received no data")
+        self.logger.error("Transcription response was empty.")
         return
       }
 
       do {
-        // Try parsing as JSON
-        if let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] {
-          if let text = json["text"] as? String {
-            DispatchQueue.main.async {
-              self.transcript += text + " "
-              self.logger.debug("Updated transcript: \(self.transcript)")
-            }
-          } else {
-            self.logger.error("Transcription response missing 'text' field")
-          }
-        } else {
-          self.logger.error("Transcription response not in expected format")
-        }
-      } catch {
-        // Try parsing as plain text if JSON fails
-        if let text = String(data: data, encoding: .utf8)?.trimmingCharacters(
-          in: .whitespacesAndNewlines),
-          !text.isEmpty
+        // Try JSON
+        if let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+          let text = json["text"] as? String
         {
           DispatchQueue.main.async {
             self.transcript += text + " "
-            self.logger.debug("Updated transcript (plain text): \(self.transcript)")
+            self.logger.info("Transcript so far: \(self.transcript)")  // debug logging
           }
-        } else {
-          self.logger.error("Transcription parse error: \(error.localizedDescription)")
+        } else if let plain = String(data: data, encoding: .utf8),
+          !plain.isEmpty
+        {
+          DispatchQueue.main.async {
+            self.transcript += plain + " "
+            self.logger.info("Transcript so far: \(self.transcript)")  // debug logging
+          }
         }
+      } catch {
+        self.logger.error("Failed to parse transcript JSON: \(error.localizedDescription)")
       }
     }.resume()
   }
 
+  // MARK: - Enhancement Flow
   private func streamEnhanceNotes(forNote note: Note) {
-    do {
+    // Reset for UI
+    self.enhancedLines = []
+    self.currentLineBuffer = ""
+
+    // Store the note being enhanced
+    self.enhancementTargetNote = note
+
+    // Only update UI elements if this is the selected note
+    if selectedNote?.id == note.id {
       DispatchQueue.main.async {
-        self.noteManager.updateEnhancingState(noteId: note.id)
+        let content = (try? self.noteManager.getNote(withId: note.id).1) ?? ""
+        self.originalLines = content.components(separatedBy: "\n")
+        self.scanningIndex = 0
+        self.isDone = false
+        self.isEnhancing = true
       }
-      notes = notes.map { n in
-        var noteCopy = n
-        noteCopy.isRecording = false
-        noteCopy.isEnhancing = n.id == note.id
-        return noteCopy
-      }
-
-      let (_, content) = try NoteManager.shared.getNote(withId: note.id)
-      guard let baseURL = CloudflareService.shared.getWorkerURL(),
-        let url = URL(string: "enhance", relativeTo: baseURL)
-      else {
-        logger.error("Cloudflare Worker URL not configured")
-        return
-      }
-
-      var request = URLRequest(url: url)
-      request.httpMethod = "POST"
-      request.setValue("text/event-stream", forHTTPHeaderField: "Accept")
-
-      let payload: [String: Any] = [
-        "notes": content,
-        "transcript": transcript,
-      ]
-      request.httpBody = try? JSONSerialization.data(withJSONObject: payload)
-      request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-
-      CloudflareService.shared.prepareRequest(&request)
-
-      // Reset state regardless of which note we're viewing
-      self.enhancedLines = []
-      self.currentLineBuffer = ""
-
-      // Only show UI if we're looking at the target note
-      if selectedNote?.id == note.id {
-        DispatchQueue.main.async {
-          self.originalLines = content.components(separatedBy: "\n")
-          self.scanningIndex = 0
-          self.isDone = false
-          self.isEnhancing = true
-        }
-      }
-
-      let task = URLSession.shared.dataTask(with: request) { _, _, _ in }
-      parseSSEStream(task: task)
-      task.resume()
-    } catch {
-      logger.error("Failed to enhance note: \(error.localizedDescription)")
     }
+
+    noteManager.updateEnhancingState(noteId: note.id)
+
+    // Set up the pipeline manager's delegate
+    let pipelineManager = LLMPipelineManager.shared
+    pipelineManager.delegate = self
+
+    // Start the enhancement process
+    pipelineManager.enhanceNote(note, transcript: transcript)
   }
 
-  private func parseSSEStream(task: URLSessionDataTask) {
-    let sessionConfig = URLSessionConfiguration.default
-    let session = URLSession(
-      configuration: sessionConfig,
-      delegate: SSEStreamDelegate(contentView: self),
-      delegateQueue: nil)
-
-    task.cancel()
-
-    if let req = task.originalRequest {
-      let newTask = session.dataTask(with: req)
-      newTask.resume()
-    }
-  }
-
+  // MARK: - SSE Content
   func appendEnhancedText(_ partialText: String) {
     DispatchQueue.main.async {
       let lines = partialText.components(separatedBy: "\n")
-
       for (i, piece) in lines.enumerated() {
         self.currentLineBuffer += piece
-
         if i < lines.count - 1 {
           self.enhancedLines.append(self.currentLineBuffer)
           self.currentLineBuffer = ""
@@ -826,7 +869,6 @@ struct ContentView: View {
           withAnimation(.easeInOut(duration: 0.3)) {
             self.scanningIndex = self.enhancedLines.count
           }
-
           DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
             withAnimation(.easeInOut(duration: 0.2)) {
               self.lastCompletedIndex = self.enhancedLines.count - 1
@@ -837,240 +879,194 @@ struct ContentView: View {
     }
   }
 
-  func finishEnhancement() {
-    DispatchQueue.main.async {
-      self.noteManager.clearStates()
+  // MARK: - Permissions
+  private func checkRecordingPermissions() async -> Bool {
+    logger.info("Checking recording permissions...")
 
-      if !self.currentLineBuffer.isEmpty {
-        self.enhancedLines.append(self.currentLineBuffer)
-        self.currentLineBuffer = ""
-      }
-
-      // Animate progress to completion first
-      withAnimation(.easeOut(duration: 0.3)) {
-        self.progressValue = 1.0
-      }
-
-      DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
-        withAnimation(.easeInOut(duration: 0.3)) {
-          self.showCheckmark = true
-          self.isDone = true
-        }
-
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
-          self.isMorphingToControls = true
-          withAnimation(.easeInOut(duration: 0.8)) {
-            self.morphProgress = 1.0
-          }
-
-          DispatchQueue.main.asyncAfter(deadline: .now() + 0.45) {
-            withAnimation(.easeOut(duration: 0.2)) {
-              self.isEnhancing = false
-            }
-
-            // Reset other states without animation
-            self.showCheckmark = false
-            self.isMorphingToControls = false
-            self.morphProgress = 0
-            self.textViewRef.textView?.forceStyleText()
-          }
-        }
-
-      }
-
-      let enhancedContent = self.enhancedLines.joined(separator: "\n")
-
-      do {
-        guard let targetNote = self.recordingTargetNote else {
-          self.logger.error("recordingTargetNote is nil, cannot update.")
-          return
-        }
-
-        try NoteManager.shared.updateNote(targetNote, withContent: enhancedContent)
-
-        if self.selectedNote?.id == targetNote.id {
-          self.typedNotes = enhancedContent
-
-          // Return to normal view after showing completion
-          DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) {
-            withAnimation(.easeOut(duration: 0.5)) {
-              self.isEnhancing = false
-              self.showCheckmark = false
-            }
-            self.textViewRef.textView?.forceStyleText()
-          }
-        }
-      } catch {
-        self.logger.error("Failed to save enhanced note: \(error.localizedDescription)")
-      }
-
-      // Clean up state
-      self.recordingTargetNote = nil
-      self.transcript = ""
+    if recordingPermission.areAllPermissionsGranted {
+      return true
     }
+
+    let granted = await recordingPermission.requestAllPermissions()
+    if !granted {
+      if recordingPermission.microphoneStatus == .denied
+        || recordingPermission.systemAudioStatus == .denied
+      {
+        NSWorkspace.shared.openSystemSettings()
+      }
+    }
+    return granted
   }
 }
 
-struct ProgressToCheckmark: View {
-  let progress: CGFloat
-  let showCheckmark: Bool
+extension ContentView: LLMPipelineDelegate {
+  func pipelineDidStart() {
+    enhancementStep = .transcribingNotes
+  }
 
-  @State private var trimEnd: CGFloat = 0
+  func pipelineDidUpdateStep(_ step: EnhancementStep) {
+    enhancementStep = step
+  }
 
-  var body: some View {
-    ZStack {
-      if !showCheckmark {
-        Circle()
-          .stroke(
-            Color.white.opacity(0.3),
-            lineWidth: 2
-          )
+  func pipelineDidReceiveContent(content: String) {
+    appendEnhancedText(content)
+  }
 
-        Circle()
-          .trim(from: 0, to: progress)
-          .stroke(
-            Color.white,
-            style: StrokeStyle(
-              lineWidth: 2,
-              lineCap: .round
-            )
-          )
-          .rotationEffect(.degrees(-90))
-      } else {
-        CheckmarkShape()
-          .trim(from: 0, to: trimEnd)
-          .stroke(
-            Color.white,
-            style: StrokeStyle(
-              lineWidth: 2,
-              lineCap: .round,
-              lineJoin: .round
-            )
-          )
-          .frame(width: 12, height: 12)
-          .onAppear {
-            withAnimation(.easeOut(duration: 0.3).delay(0.1)) {
-              trimEnd = 1
-            }
-          }
+  func pipelineDidComplete() {
+    // Complete the enhancement with UI animations
+    let enhancedLines = self.enhancedLines
+    var finalContent = enhancedLines.joined(separator: "\n")
+
+    if !currentLineBuffer.isEmpty {
+      let lastLine = enhancedLines.last ?? ""
+      if lastLine != currentLineBuffer {
+        finalContent = finalContent + (finalContent.isEmpty ? "" : "\n") + currentLineBuffer
       }
     }
-  }
-}
 
-struct CheckmarkShape: Shape {
-  func path(in rect: CGRect) -> Path {
-    var path = Path()
-
-    // Calculate checkmark points
-    let midX = rect.midX
-    let midY = rect.midY
-
-    // Start point of the checkmark (left)
-    path.move(to: CGPoint(x: midX - 4, y: midY))
-
-    // Bottom point of the checkmark
-    path.addLine(to: CGPoint(x: midX - 1, y: midY + 3))
-
-    // End point of the checkmark (right)
-    path.addLine(to: CGPoint(x: midX + 4, y: midY - 3))
-
-    return path
-  }
-}
-
-class SSEStreamDelegate: NSObject, URLSessionDataDelegate {
-  var contentView: ContentView
-  private var partialBuffer = Data()
-
-  init(contentView: ContentView) {
-    self.contentView = contentView
-  }
-
-  func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
-    partialBuffer.append(data)
-
-    while let newlineRange = partialBuffer.range(of: Data([0x0A])) {
-      let lineData = partialBuffer.subdata(in: 0..<newlineRange.lowerBound)
-      partialBuffer.removeSubrange(0..<(newlineRange.upperBound))
-
-      guard !lineData.isEmpty else { continue }
-
-      if let lineStr = String(data: lineData, encoding: .utf8) {
-        // Remove "data: " prefix if present
-        let cleaned = lineStr.replacingOccurrences(of: "data: ", with: "")
-          .trimmingCharacters(in: .whitespacesAndNewlines)
-
-        guard !cleaned.isEmpty else { continue }
-
-        if cleaned == "[DONE]" {
-          contentView.finishEnhancement()
-          continue
-        }
-
-        do {
-          if let jsonData = cleaned.data(using: .utf8),
-            let dict = try JSONSerialization.jsonObject(with: jsonData) as? [String: Any]
-          {
-            if let partialText = dict["response"] as? String {
-              contentView.appendEnhancedText(partialText)
-            } else {
-              contentView.logger.warning("SSE response missing 'response' field: \(cleaned)")
-            }
-          } else {
-            // If not JSON, try using the cleaned text directly
-            if !cleaned.starts(with: "{") && !cleaned.starts(with: "[") {
-              contentView.appendEnhancedText(cleaned)
-            } else {
-              contentView.logger.warning("SSE response not in expected format: \(cleaned)")
-            }
-          }
-        } catch {
-          contentView.logger.warning(
-            "SSE parse error: \(error.localizedDescription), raw line: \(cleaned)")
-        }
-      }
+    // Ensure we have a targetNote to work with
+    guard let targetNote = self.enhancementTargetNote else {
+      return
     }
-  }
 
-  func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
-    if let error = error {
-      contentView.logger.error("SSE completed with error: \(error.localizedDescription)")
+    noteManager.clearPendingTranscript(noteId: targetNote.id)
+    noteManager.clearStates()
+    noteManager.refreshNotes()
+    self.recordingTargetNote = nil
+
+    // Process the enhanced content
+    processEnhancedContent(finalContent, forNote: targetNote)
+
+    // Handle UI animations
+    if selectedNote?.id == targetNote.id {
+      animateEnhancementCompletion()
     } else {
-      contentView.logger.info("SSE completed successfully")
+      // If not looking at the enhanced note, just clean up
+      DispatchQueue.main.async {
+        noteManager.updateEnhancingState(noteId: nil)
+        self.enhancementTargetNote = nil
+      }
     }
-    contentView.finishEnhancement()
   }
-}
 
-// Helper view to measure text height
-struct TextMeasurementView: View {
-  let text: String
-  let fontSize: CGFloat
-  let maxWidth: CGFloat
-  let onHeightChange: (CGFloat) -> Void
-
-  var body: some View {
-    Text(text)
-      .font(.system(size: fontSize, weight: .regular, design: .rounded))
-      .frame(maxWidth: maxWidth, alignment: .leading)
-      .background(
-        GeometryReader { geometry in
-          Color.clear.onAppear {
-            onHeightChange(geometry.size.height)
+  func pipelineDidFail(error: Error) {
+    DispatchQueue.main.async {
+      if case let AIClientError.serverError(statusCode, retryCount) = error {
+        viewState.errorState.show(
+          message: "Server error (Status \(statusCode)). Retrying...",
+          retryCount: retryCount + 1,
+          maxRetries: 3
+        )
+      } else if case let AIClientError.maxRetriesExceeded(statusCode) = error {
+        viewState.errorState.show(
+          message: "Server error (Status \(statusCode)). Enhancement failed."
+        )
+        DispatchQueue.main.asyncAfter(deadline: .now() + 5) {
+          withAnimation {
+            viewState.errorState.clear()
           }
         }
-      )
+        self.isEnhancing = false
+        self.enhancementTargetNote = nil
+      } else {
+        viewState.errorState.show(
+          message: "Enhancement failed: \(error.localizedDescription)"
+        )
+        DispatchQueue.main.asyncAfter(deadline: .now() + 5) {
+          withAnimation {
+            viewState.errorState.clear()
+          }
+        }
+        self.isEnhancing = false
+        self.enhancementTargetNote = nil
+      }
+
+      // Clear and reset any enhancement state
+      self.enhancedLines = []
+      self.currentLineBuffer = ""
+    }
+  }
+
+  private func processEnhancedContent(_ enhancedContent: String, forNote note: Note) {
+    // Get the original content for the target note
+    let originalContent: String
+    do {
+      let (_, content) = try noteManager.getNote(withId: note.id)
+      originalContent = content
+    } catch {
+      logger.error(
+        "Failed to get original content for note \(note.id): \(error.localizedDescription)")
+      originalContent = ""
+    }
+
+    // Save a version and update the note with enhanced content
+    LLMPipelineManager.shared.finishEnhancement(
+      enhancedContent: enhancedContent,
+      forNote: note,
+      originalContent: originalContent
+    )
+
+    // If the enhanced note is the currently selected note, update the UI
+    if selectedNote?.id == note.id {
+      self.typedNotes = enhancedContent
+      self.viewingVersionContent = nil
+      self.selectedVersion = nil
+      updateVersionsForCurrentNote()
+    }
+  }
+
+  private func animateEnhancementCompletion() {
+    debugManager.completeStep(.enhancing)
+
+    // Animate progress -> checkmark
+    withAnimation(.easeOut(duration: 0.3)) {
+      self.progressValue = 1.0
+    }
+
+    DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+      withAnimation(.easeInOut(duration: 0.3)) {
+        self.showCheckmark = true
+        self.isDone = true
+      }
+
+      DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
+        self.isMorphingToControls = true
+        withAnimation(.easeInOut(duration: 0.8)) {
+          self.morphProgress = 1.0
+        }
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.45) {
+          withAnimation(.easeOut(duration: 0.2)) {
+            self.isEnhancing = false
+          }
+          self.showCheckmark = false
+          self.isMorphingToControls = false
+          self.morphProgress = 0
+          self.textViewRef.textView?.forceStyleText()
+
+          self.updateVersionsForCurrentNote()
+
+          // Final cleanup
+          self.transcript = ""
+          self.enhancementTargetNote = nil
+
+          // Make sure note is no longer marked as enhancing
+          self.noteManager.updateEnhancingState(noteId: nil)
+        }
+      }
+    }
   }
 }
 
+// MARK: - Helper Views
+
+// Reads the sidebar's width so we can position toolbar items dynamically.
 struct SidebarWidthReader: NSViewRepresentable {
   let onWidthChange: (CGFloat) -> Void
 
   func makeNSView(context: Context) -> NSView {
     let view = NSView()
     view.postsFrameChangedNotifications = true
-
     NotificationCenter.default.addObserver(
       forName: NSView.frameDidChangeNotification,
       object: view,
@@ -1087,10 +1083,9 @@ struct SidebarWidthReader: NSViewRepresentable {
 extension NSWorkspace {
   func openSystemSettings() {
     guard let url = urlForApplication(withBundleIdentifier: "com.apple.systempreferences") else {
-      assertionFailure("Failed to get System Settings app URL")
+      assertionFailure("Could not get System Settings app URL")
       return
     }
-
     openApplication(at: url, configuration: .init())
   }
 }

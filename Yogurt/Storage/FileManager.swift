@@ -68,14 +68,6 @@ class NoteFileManager {
     return noteDir.appendingPathComponent("\(safeTitle).md")
   }
 
-  private func getVersionedFile(inDirectory noteDir: URL, title: String, timestamp: Date) -> URL {
-    let safeTitle = sanitizeFilename(title)
-    let dateFormatter = DateFormatter()
-    dateFormatter.dateFormat = "yyyy-MM-dd HH.mm.ss"
-    let timeString = dateFormatter.string(from: timestamp)
-    return noteDir.appendingPathComponent("\(safeTitle) (\(timeString)).md")
-  }
-
   func saveNote(_ content: String, withId id: String, title: String) throws {
     let noteDir = try getNoteDirectory(forId: id)
     let newFile = getCurrentNoteFile(inDirectory: noteDir, title: title)
@@ -116,25 +108,6 @@ class NoteFileManager {
     return getCurrentNoteFile(inDirectory: noteDir, title: title)
   }
 
-  // Called specifically when recording stops, before enhancement
-  func saveVersionedCopy(forId id: String, title: String) throws {
-    let noteDir = try getNoteDirectory(forId: id)
-    let currentFile = getCurrentNoteFile(inDirectory: noteDir, title: title)
-
-    // Only create version if current version exists
-    guard fileManager.fileExists(atPath: currentFile.path) else { return }
-
-    do {
-      let content = try String(contentsOf: currentFile, encoding: .utf8)
-      let versionedFile = getVersionedFile(inDirectory: noteDir, title: title, timestamp: Date())
-      try content.write(to: versionedFile, atomically: true, encoding: .utf8)
-      logger.info("Saved versioned copy: \(id) as \(versionedFile.lastPathComponent)")
-    } catch {
-      logger.error("Failed to save versioned copy \(id): \(error.localizedDescription)")
-      throw NoteFileManagerError.saveFailed(error)
-    }
-  }
-
   func readNote(withId id: String, title: String) throws -> String {
     let noteDir = try getNoteDirectory(forId: id)
     let noteFile = getCurrentNoteFile(inDirectory: noteDir, title: title)
@@ -167,15 +140,45 @@ class NoteFileManager {
     }
   }
 
-  func getOriginalVersions(forId id: String) throws -> [URL] {
-    let noteDir = try getNoteDirectory(forId: id)
+  func createVersion(forId id: String, content: String) throws
+    -> NoteVersion
+  {
+    let versionsDir = try getVersionsDirectory(forId: id)
+    let versionId = UUID()
+    let version = NoteVersion(
+      id: versionId,
+      timestamp: Date(),
+      filePath: "\(versionId).md"
+    )
 
-    do {
-      let files = try fileManager.contentsOfDirectory(at: noteDir, includingPropertiesForKeys: nil)
-      return files.filter { $0.lastPathComponent.contains("original") }
-    } catch {
-      logger.error("Failed to get original versions for note \(id): \(error.localizedDescription)")
-      throw NoteFileManagerError.readFailed(error)
+    // Save version content
+    let versionFile = versionsDir.appendingPathComponent(version.filePath)
+    try content.write(to: versionFile, atomically: true, encoding: .utf8)
+
+    // Save version metadata to database
+    try DatabaseManager.shared.saveVersion(version, forNoteId: id)
+
+    return version
+  }
+
+  func getVersionContent(forId id: String, version: NoteVersion) throws -> String {
+    let versionsDir = try getVersionsDirectory(forId: id)
+    let versionFile = versionsDir.appendingPathComponent(version.filePath)
+    return try String(contentsOf: versionFile, encoding: .utf8)
+  }
+
+  private func getVersionsDirectory(forId id: String) throws -> URL {
+    let noteDir = try getNoteDirectory(forId: id)
+    let versionsDir = noteDir.appendingPathComponent("versions", isDirectory: true)
+
+    if !fileManager.fileExists(atPath: versionsDir.path) {
+      try fileManager.createDirectory(at: versionsDir, withIntermediateDirectories: true)
     }
+
+    return versionsDir
+  }
+
+  func getVersions(forId id: String) throws -> [NoteVersion] {
+    return try DatabaseManager.shared.getVersions(forNoteId: id)
   }
 }

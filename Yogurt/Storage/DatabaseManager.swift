@@ -13,11 +13,16 @@ class DatabaseManager {
   private let id = SQLite.Expression<String>("id")
   private let title = SQLite.Expression<String>("title")
   private let lastModified = SQLite.Expression<Date>("last_modified")
-  private let hasEnhancedVersion = SQLite.Expression<Bool>("has_enhanced_version")
 
   private let config = Table("config")
   private let key = SQLite.Expression<String>("key")
   private let value = SQLite.Expression<String?>("value")
+
+  private let versions = Table("versions")
+  private let versionId = SQLite.Expression<UUID>("id")
+  private let noteId = SQLite.Expression<String>("note_id")
+  private let versionTimestamp = SQLite.Expression<Date>("timestamp")
+  private let versionPath = SQLite.Expression<String>("file_path")
 
   private let workerURLKey = "cloudflare_worker_url"
   private let selectedProcessKey = "selected_audio_process"
@@ -51,6 +56,7 @@ class DatabaseManager {
       try db?.execute("PRAGMA foreign_keys = ON")
       try db?.execute("PRAGMA journal_mode = WAL")
 
+      try migrateDatabase()
       try createTables()
       try setupConfigTable()
       logger.info("Database setup complete at: \(dbURL.path)")
@@ -68,10 +74,24 @@ class DatabaseManager {
         t.column(id, primaryKey: true)
         t.column(title)
         t.column(lastModified)
-        t.column(hasEnhancedVersion)
       })
 
     try db.run(notes.createIndex(lastModified, ifNotExists: true))
+
+    // Add versions table
+    try db.run(
+      versions.create(ifNotExists: true) { t in
+        t.column(versionId, primaryKey: true)
+        t.column(noteId)
+        t.column(versionTimestamp)
+        t.column(versionPath)
+
+        // Add foreign key constraint
+        t.foreignKey(noteId, references: notes, id, update: .cascade, delete: .cascade)
+      })
+
+    // Add indexes
+    try db.run(versions.createIndex(noteId, versionTimestamp, ifNotExists: true))
   }
 
   func insertNote(_ note: Note) throws {
@@ -81,8 +101,7 @@ class DatabaseManager {
       or: .replace,
       id <- note.id,
       title <- note.title,
-      lastModified <- note.lastModified,
-      hasEnhancedVersion <- note.hasEnhancedVersion
+      lastModified <- note.lastModified
     )
 
     try db.run(insert)
@@ -96,8 +115,7 @@ class DatabaseManager {
     try db.run(
       noteRecord.update(
         title <- note.title,
-        lastModified <- note.lastModified,
-        hasEnhancedVersion <- note.hasEnhancedVersion
+        lastModified <- note.lastModified
       ))
 
     logger.info("Updated note: \(note.id)")
@@ -121,8 +139,7 @@ class DatabaseManager {
       let note = Note(
         id: row[id],
         title: row[title],
-        lastModified: row[lastModified],
-        hasEnhancedVersion: row[hasEnhancedVersion]
+        lastModified: row[lastModified]
       )
       allNotes.append(note)
     }
@@ -139,9 +156,38 @@ class DatabaseManager {
     return Note(
       id: row[id],
       title: row[title],
-      lastModified: row[lastModified],
-      hasEnhancedVersion: row[hasEnhancedVersion]
+      lastModified: row[lastModified]
     )
+  }
+
+  // Note versions
+  func saveVersion(_ version: NoteVersion, forNoteId noteId: String) throws {
+    guard let db = db else { throw DatabaseError.notConnected }
+
+    let insert = versions.insert(
+      versionId <- version.id,
+      self.noteId <- noteId,
+      versionTimestamp <- version.timestamp,
+      versionPath <- version.filePath
+    )
+
+    try db.run(insert)
+    logger.info("Saved version \(version.id) for note: \(noteId)")
+  }
+
+  func getVersions(forNoteId noteId: String) throws -> [NoteVersion] {
+    guard let db = db else { throw DatabaseError.notConnected }
+
+    let query = versions.filter(self.noteId == noteId)
+      .order(versionTimestamp.desc)
+
+    return try db.prepare(query).map { row in
+      NoteVersion(
+        id: row[versionId],
+        timestamp: row[versionTimestamp],
+        filePath: row[versionPath]
+      )
+    }
   }
 
   // Cloudflare app configuration
@@ -227,6 +273,59 @@ class DatabaseManager {
       return nil
     }
   }
+
+  // Database migrations
+  private func migrateDatabase() throws {
+    guard let db = db else { return }
+
+    // Check if the legacy column exists
+    let pragmaStatement = "PRAGMA table_info(notes)"
+    var hasEnhancementColumn = false
+
+    // Each row from PRAGMA table_info returns: cid, name, type, notnull, dflt_value, pk
+    for row in try db.prepare(pragmaStatement) {
+      if let columnName = row[1] as? String, columnName == "has_enhanced_version" {
+        hasEnhancementColumn = true
+        break
+      }
+    }
+
+    // If the legacy column exists, perform the migration
+    if hasEnhancementColumn {
+      logger.info("Legacy 'has_enhanced_version' column detected. Migrating notes table…")
+      try db.transaction {
+        // Create a temporary table with the new schema.
+        try db.run(
+          """
+          CREATE TABLE notes_new (
+              id TEXT PRIMARY KEY,
+              title TEXT,
+              last_modified DATE
+          )
+          """)
+
+        // Copy data from the old table to the new table
+        try db.run(
+          """
+          INSERT INTO notes_new (id, title, last_modified)
+          SELECT id, title, last_modified FROM notes
+          """)
+
+        // Drop the old table
+        try db.run("DROP TABLE notes")
+
+        // Rename the new table to the original name
+        try db.run("ALTER TABLE notes_new RENAME TO notes")
+
+        // Recreate any indexes that existed on the old table
+        try db.run("CREATE INDEX IF NOT EXISTS index_notes_last_modified ON notes(last_modified)")
+      }
+      logger.info("Migration complete: 'has_enhanced_version' column removed.")
+    } else {
+      logger.info("No migration needed for notes table.")
+    }
+  }
+
 }
 
 enum DatabaseError: Error {

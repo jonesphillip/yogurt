@@ -26,6 +26,12 @@ struct YogurtApp: App {
           showingConfig = true
         }
         .keyboardShortcut(",", modifiers: [.command])
+
+        Divider()
+        Button("View Enhancement Progress") {
+          DebugWindowController.shared.toggleWindow()
+        }
+        .keyboardShortcut("d", modifiers: [.command])
       }
     }
   }

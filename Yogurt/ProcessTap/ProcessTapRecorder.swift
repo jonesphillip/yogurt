@@ -1,20 +1,10 @@
 import AVFoundation
+import CoreAudio
 import Foundation
 import OSLog
+import Observation
 
-// MARK: - Custom Error
-struct TranscriberError: Error, CustomStringConvertible {
-  let message: String
-  var description: String { "TranscriberError: \(message)" }
-}
-
-// A helper for writing integers in little-endian
-extension FixedWidthInteger {
-  fileprivate var leBytes: [UInt8] {
-    withUnsafeBytes(of: self.littleEndian) { Array($0) }
-  }
-}
-
+@Observable
 final class ProcessTapRecorder {
   private let logger = Logger(subsystem: kAppSubsystem, category: "ProcessTapRecorder")
 
@@ -27,137 +17,75 @@ final class ProcessTapRecorder {
   private var lastFlushTime = Date()
   private let flushInterval: TimeInterval = 5.0
 
+  // amplitude in [0...1], updated after each buffer (throttled)
+  var amplitude: Float = 0.0
+  private var lastAmplitudeUpdate = Date()
+  private let amplitudeUpdateInterval: TimeInterval = 0.1
+
   init(process: AudioProcess, chunkHandler: @escaping (Data) -> Void) {
-    let browserFinder = DefaultBrowserFinder()
-
-    // If this is Safari (either as default or selected), use GPU process
-    let finalProcess: AudioProcess
-    if process.bundleURL?.path != nil,
-      let bundleID = Bundle(url: process.bundleURL!)?.bundleIdentifier,
-      bundleID == "com.apple.Safari"
-    {
-      do {
-        finalProcess = try browserFinder.findSafariGPUProcess()
-      } catch {
-        logger.error("Failed to find Safari GPU process: \(error.localizedDescription)")
-        finalProcess = process  // Fallback to original process if GPU process not found
-      }
-    } else {
-      finalProcess = process
-    }
-
-    self.tap = ProcessTap(process: finalProcess, muteWhenRunning: false)
+    self.tap = ProcessTap(process: process, muteWhenRunning: false)
     self.chunkHandler = chunkHandler
   }
 
   @MainActor
   func start() throws {
-    logger.debug("Starting tap transcriber for process: \(self.tap.process.name)")
-
+    logger.debug("Starting tap for process: \(self.tap.process.name)")
     try tap.activate()
 
-    guard var streamDescription = tap.tapStreamDescription else {
-      throw TranscriberError(message: "Tap stream description not available.")
-    }
-
-    // Modify stream description for optimization
-    streamDescription.mSampleRate = 16000
-    streamDescription.mChannelsPerFrame = 1
-    streamDescription.mBitsPerChannel = 16
-    streamDescription.mBytesPerFrame = 2
-    streamDescription.mBytesPerPacket = 2
-    streamDescription.mFormatFlags = kAudioFormatFlagIsSignedInteger | kAudioFormatFlagIsPacked
-
-    let settings: [String: Any] = [
-      AVFormatIDKey: streamDescription.mFormatID,
-      AVSampleRateKey: streamDescription.mSampleRate,
-      AVNumberOfChannelsKey: streamDescription.mChannelsPerFrame,
-      AVLinearPCMBitDepthKey: 16,
-      AVLinearPCMIsFloatKey: false,
-      AVLinearPCMIsNonInterleaved: false,
-    ]
-
-    // Start the tap with I/O callback
+    // Run the aggregator callback
     try tap.run(
       on: queue,
-      ioBlock: { [weak self] inNow, inInputData, inInputTime, outOutputData, inOutputTime in
+      ioBlock: { [weak self] _, inData, _, _, _ in
         guard let self = self else { return }
 
-        let inputData = inInputData.pointee.mBuffers
-        guard inputData.mData != nil, inputData.mDataByteSize > 0 else { return }
+        let input = inData.pointee.mBuffers
+        guard let srcPtr = input.mData, input.mDataByteSize > 0 else { return }
 
-        // Calculate frame count from input data
-        let frameCount = Int(inputData.mDataByteSize) / (4 * 2)  // 4 bytes per float32, 2 channels
+        // input is stereo Float32 at system rate, e.g. 48 kHz
+        let byteCount = Int(input.mDataByteSize)
+        let frames = byteCount / (MemoryLayout<Float32>.size * 2)
+        let floatPtr = srcPtr.assumingMemoryBound(to: Float32.self)
 
-        // Create optimized format PCM buffer with correct capacity
-        let format = AVAudioFormat(
-          commonFormat: .pcmFormatInt16,
-          sampleRate: 16000,
-          channels: 1,
-          interleaved: true)!
+        // Downmix to mono Int16
+        let monoInt16 = AudioCaptureUtils.downmixStereoFloat32ToMonoInt16(
+          srcPtr: floatPtr,
+          frameCount: frames
+        )
 
-        guard
-          let pcmBuffer = AVAudioPCMBuffer(
-            pcmFormat: format,
-            frameCapacity: AVAudioFrameCount(frameCount))
-        else {
-          self.logger.error("Failed to create PCM buffer")
-          return
-        }
-
-        let srcData = inputData.mData?.assumingMemoryBound(to: Float32.self)
-        guard let srcSamples = srcData else { return }
-        guard let dstSamples = pcmBuffer.int16ChannelData?[0] else { return }
-
-        // Mix stereo to mono and convert float32 to int16
-        for frame in 0..<frameCount {
-          let leftSample = srcSamples[frame * 2]
-          let rightSample = srcSamples[frame * 2 + 1]
-          let monoSample = (leftSample + rightSample) / 2.0
-          dstSamples[frame] = Int16(max(-32768, min(32767, monoSample * 32767.0)))
-        }
-
-        pcmBuffer.frameLength = AVAudioFrameCount(frameCount)
-
-        // Convert to 8-bit for streaming
-        var audioData = Data(capacity: frameCount)
-
-        for frame in 0..<frameCount {
-          let sample = dstSamples[frame]
-          let normalized = Float(sample) / Float(Int16.max)
-          let mapped = UInt8(max(0, min(255, (normalized + 1.0) * 128)))
-          audioData.append(mapped)
-        }
-
-        self.pendingBuffer.append(audioData)
+        let int16Data = AudioCaptureUtils.int16ArrayToData(monoInt16)
+        self.pendingBuffer.append(int16Data)
 
         let now = Date()
         if now.timeIntervalSince(self.lastFlushTime) >= self.flushInterval {
-          let wavData = self.makeWavDataFromPendingBuffer(
-            self.pendingBuffer,
+          let wavData = AudioCaptureUtils.makeWavData(
+            pcmData: self.pendingBuffer,
             sampleRate: 16000,
-            channels: 1
+            channels: 1,
+            bitsPerSample: 16
           )
-
-          if let handler = self.chunkHandler {
-            handler(wavData)
-          }
-
+          self.chunkHandler?(wavData)
           self.pendingBuffer.removeAll()
           self.lastFlushTime = now
         }
+
+        // Compute amplitude
+        let newAmp = monoInt16.withUnsafeBufferPointer { bufPtr in
+          AudioCaptureUtils.computeRMSAmplitude(
+            int16Samples: bufPtr.baseAddress!,
+            frameCount: frames
+          )
+        }
+        self.throttleAmplitudeUpdate(newAmp)
       },
-      invalidationHandler: { [weak self] tap in
-        guard let self = self else { return }
-        self.handleInvalidation()
-        self.logger.debug("Tap invalidated for process: \(tap.process.name)")
+      invalidationHandler: { [weak self] _ in
+        self?.handleInvalidation()
       })
 
     isRunning = true
   }
 
   func stop() {
-    logger.debug("Stopping tap transcriber for process: \(self.tap.process.name)")
+    logger.debug("Stopping tap for process: \(self.tap.process.name)")
     guard isRunning else { return }
 
     do {
@@ -167,63 +95,33 @@ final class ProcessTapRecorder {
     }
     isRunning = false
 
-    // Final flush if needed
+    // Final flush
     if !pendingBuffer.isEmpty {
-      self.logger.info("Final flush of pending buffer on stop()")
-      let wavData = makeWavDataFromPendingBuffer(
-        pendingBuffer,
-        sampleRate: 44100,  // Or use last known sampleRate
-        channels: 2  // Or use last known channelCount
+      let wavData = AudioCaptureUtils.makeWavData(
+        pcmData: pendingBuffer,
+        sampleRate: 16000,
+        channels: 1,
+        bitsPerSample: 16
       )
-      if let handler = self.chunkHandler {
-        handler(wavData)
-      }
+      chunkHandler?(wavData)
       pendingBuffer.removeAll()
     }
   }
 
   private func handleInvalidation() {
-    guard isRunning else { return }
-
-    logger.debug(#function)
+    logger.debug("Tap invalidated")
+    if isRunning {
+      logger.info("Tap forcibly invalidated while running")
+    }
   }
 
-  // Builds a minimal in-memory WAV from raw 8-bit samples
-  private func makeWavDataFromPendingBuffer(
-    _ pcmData: Data,
-    sampleRate: Float64,
-    channels: UInt32
-  ) -> Data {
-
-    let bitsPerSample: UInt16 = 8
-    let blockAlign = UInt16(channels) * bitsPerSample / 8
-    let byteRate = UInt32(sampleRate) * UInt32(blockAlign)
-
-    let subchunk2Size = UInt32(pcmData.count)
-    let chunkSize = 36 + subchunk2Size
-
-    var wav = Data()
-
-    // "RIFF" header
-    wav.append(contentsOf: "RIFF".utf8)
-    wav.append(contentsOf: chunkSize.leBytes)
-    wav.append(contentsOf: "WAVE".utf8)
-
-    // "fmt " chunk
-    wav.append(contentsOf: "fmt ".utf8)
-    wav.append(contentsOf: UInt32(16).leBytes)  // PCM
-    wav.append(contentsOf: UInt16(1).leBytes)  // PCM format
-    wav.append(contentsOf: UInt16(channels).leBytes)  // Channels
-    wav.append(contentsOf: UInt32(sampleRate).leBytes)  // Sample rate
-    wav.append(contentsOf: byteRate.leBytes)  // Byte rate
-    wav.append(contentsOf: blockAlign.leBytes)  // Block align
-    wav.append(contentsOf: bitsPerSample.leBytes)  // Bits per sample
-
-    // "data" chunk
-    wav.append(contentsOf: "data".utf8)
-    wav.append(contentsOf: subchunk2Size.leBytes)
-    wav.append(pcmData)
-
-    return wav
+  private func throttleAmplitudeUpdate(_ newAmp: Float) {
+    let now = Date()
+    if now.timeIntervalSince(lastAmplitudeUpdate) > amplitudeUpdateInterval {
+      Task { @MainActor in
+        self.amplitude = newAmp
+      }
+      lastAmplitudeUpdate = now
+    }
   }
 }
