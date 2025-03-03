@@ -26,9 +26,8 @@ On first launch, you'll need to configure your Cloudflare Worker URL in the sett
   - System-wide audio
   - Specific application audio (e.g., Zoom, browsers for Google Meet)
   - Microphone input
-- Transcript-aware note enhancement
-  - Assumes that you know and are taking note of the key points in meetings and fills out details you may have missed after your meeting
-  - Improves note structure and format
+- Transcript-aware note enhancement that integrates raw transcripts, key points, action items, and personal notes into refined meeting notes
+- Automatic versioning of notes to keep historical copies for easy reference or rollback
 - Stores notes locally as Markdown (.md) files
 
 ## System requirements
@@ -52,14 +51,18 @@ Yogurt supports macOS v14.4 or later. You'll need Xcode 15.0 or later to develop
 
 ## Cloudflare Worker configuration
 
-The app requires a [Cloudflare Worker](https://developers.cloudflare.com/workers/) with two endpoints:
+The app requires a [Cloudflare Worker](https://developers.cloudflare.com/workers/) with these endpoints:
 
-- `/transcribe`: Handles audio transcription
-- `/enhance`: Processes and enhances notes
+- `/transcribe`: Receives raw audio (WAV/base64) and returns a transcript
+- `/transcription-notes`: Takes the transcript and produces concise bullet-style notes.
+- `/points-of-emphasis`: Compares your notes to the transcript notes to identify shared emphasis points.
+- `/action-items`: Extracts all actionable tasks or follow-ups found in your notes + transcript notes.
+- `/final-notes`: Combines your notes, transcript notes, points of emphasis, and action items into a final “enhanced” version of your meeting notes.
 
 The Worker should accept:
 - Audio data in WAV format for transcription
-- JSON payloads containing note content and transcripts for enhancement
+- JSON payloads with appropriate fields for each stage (e.g. `transcript`, `userNotes`, etc.)
+- Return partial results via Server-Sent Events (SSE)
 
 [Yogurt Worker](https://github.com/jonesphillip/yogurt-worker) is a working implementation you can deploy in your Cloudflare account.
 
