@@ -11,13 +11,13 @@ enum AIModel {
     }
     let fullText =
       responseText
-      .components(separatedBy: "\n\n")
-      .compactMap { message -> String? in
-        guard message.hasPrefix("data: ") else { return nil }
-        let jsonStr = String(message.dropFirst(6))
+      .components(separatedBy: "\n")
+      .compactMap { line -> String? in
+        guard line.hasPrefix("data: ") else { return nil }
+        let jsonStr = String(line.dropFirst(6))
         guard let data = jsonStr.data(using: .utf8),
-          let json = try? JSONSerialization.jsonObject(with: data) as? [String: String],
-          let response = json["response"]
+          let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+          let response = json["response"] as? String
         else {
           return nil
         }
@@ -223,6 +223,7 @@ class AIStreamDelegate: NSObject, URLSessionDataDelegate {
   private let model: AIModel
   private var partialBuffer = Data()
   private var thoughtBuffer = ""
+  private var contentBuffer = ""
   private var isProcessingThoughts = true
   private var isFirstAfterThoughts = false
   private let logger = Logger(subsystem: kAppSubsystem, category: "AIStreamDelegate")
@@ -248,6 +249,7 @@ class AIStreamDelegate: NSObject, URLSessionDataDelegate {
   func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
     partialBuffer.append(data)
 
+    // Process complete lines in the buffer
     while let newlineRange = partialBuffer.range(of: Data([0x0A])) {
       let lineData = partialBuffer.subdata(in: 0..<newlineRange.lowerBound)
       partialBuffer.removeSubrange(0..<(newlineRange.upperBound))
@@ -258,47 +260,64 @@ class AIStreamDelegate: NSObject, URLSessionDataDelegate {
         !lineStr.isEmpty
       else { continue }
 
-      let cleaned = lineStr.hasPrefix("data: ") ? String(lineStr.dropFirst(6)) : lineStr
-      if cleaned == "[DONE]" {
-        // Only call didComplete if we haven't already
-        if !hasCompleted {
-          hasCompleted = true
-          delegate?.didComplete()
-        }
-        return
-      }
+      // Check for SSE event prefix and handle as proper SSE message
+      if lineStr.hasPrefix("data: ") {
+        let eventData = String(lineStr.dropFirst(6))
 
-      guard let data = cleaned.data(using: .utf8),
-        let json = try? JSONSerialization.jsonObject(with: data) as? [String: String],
-        let response = json["response"]
-      else {
-        logger.error("Failed to parse JSON from line: \(cleaned)")
-        continue
-      }
-
-      if case .DS = model, isProcessingThoughts {
-        if response.contains("</think>") {
-          isProcessingThoughts = false
-          isFirstAfterThoughts = true
-          let components = response.components(separatedBy: "</think>")
-          let thoughts = (thoughtBuffer + components[0])
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-          delegate?.didReceiveThoughts(thoughts: thoughts)
-
-          if components.count > 1 {
-            let content = components[1].trimmingCharacters(in: .whitespacesAndNewlines)
-            if !content.isEmpty {
-              delegate?.didReceiveContent(content: content)
-              isFirstAfterThoughts = false
-            }
+        // Handle special DONE message
+        if eventData == "[DONE]" {
+          if !hasCompleted {
+            hasCompleted = true
+            delegate?.didComplete()
           }
-          thoughtBuffer = ""
+          return
+        }
+
+        // Parse the JSON content
+        guard let data = eventData.data(using: .utf8),
+          let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+          let response = json["response"] as? String
+        else {
+          logger.error("Failed to parse JSON from line: \(eventData)")
+          continue
+        }
+
+        // Skip empty responses to avoid unnecessary updates
+        if response.isEmpty {
+          continue
+        }
+
+        // Handle model-specific processing
+        if case .DS = model, isProcessingThoughts {
+          if response.contains("</think>") {
+            isProcessingThoughts = false
+            isFirstAfterThoughts = true
+            let components = response.components(separatedBy: "</think>")
+            let thoughts = (thoughtBuffer + components[0])
+              .trimmingCharacters(in: .whitespacesAndNewlines)
+            delegate?.didReceiveThoughts(thoughts: thoughts)
+
+            if components.count > 1 {
+              let content = components[1].trimmingCharacters(in: .whitespacesAndNewlines)
+              if !content.isEmpty {
+                contentBuffer += content
+                delegate?.didReceiveContent(content: content)
+                isFirstAfterThoughts = false
+              }
+            }
+            thoughtBuffer = ""
+          } else {
+            thoughtBuffer += response
+          }
         } else {
-          thoughtBuffer += response
+          // For non-thoughts content, accumulate and send
+          contentBuffer += response
+          delegate?.didReceiveContent(content: response)
+          isFirstAfterThoughts = false
         }
       } else {
-        delegate?.didReceiveContent(content: response)
-        isFirstAfterThoughts = false
+        // Handle non-data lines
+        logger.debug("Received non-data SSE line: \(lineStr)")
       }
     }
   }
