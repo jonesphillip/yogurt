@@ -5,7 +5,6 @@ import Security
 class CloudflareService: ObservableObject {
   static let shared = CloudflareService()
   @Published private(set) var isConfigured: Bool = false
-  @Published private(set) var hasServiceToken: Bool = false
 
   private let logger = Logger(subsystem: kAppSubsystem, category: "CloudflareService")
 
@@ -23,7 +22,6 @@ class CloudflareService: ObservableObject {
 
   private func loadCredentials() {
     isConfigured = getWorkerURL() != nil
-    hasServiceToken = getClientId() != nil && getClientSecret() != nil
   }
 
   func getWorkerURL() -> URL? {
@@ -108,8 +106,8 @@ class CloudflareService: ObservableObject {
       request.setValue(clientSecret, forHTTPHeaderField: "CF-Access-Client-Secret")
 
       // Verify headers were set
-      if let setClientId = request.value(forHTTPHeaderField: "CF-Access-Client-Id"),
-        let setClientSecret = request.value(forHTTPHeaderField: "CF-Access-Client-Secret")
+      if request.value(forHTTPHeaderField: "CF-Access-Client-Id") != nil,
+        request.value(forHTTPHeaderField: "CF-Access-Client-Secret") != nil
       {
         logger.debug("Authentication headers successfully set")
       } else {

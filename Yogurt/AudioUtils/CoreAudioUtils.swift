@@ -35,15 +35,6 @@ extension AudioObjectID {
     try AudioDeviceID.system.readDefaultSystemOutputDevice()
   }
 
-  static func readProcessList() throws -> [AudioObjectID] {
-    try AudioObjectID.system.readProcessList()
-  }
-
-  /// Reads `kAudioHardwarePropertyTranslatePIDToProcessObject` for the specific pid.
-  static func translatePIDToProcessObjectID(pid: pid_t) throws -> AudioObjectID {
-    try AudioDeviceID.system.translatePIDToProcessObjectID(pid: pid)
-  }
-
   /// Reads `kAudioHardwarePropertyProcessObjectList`.
   func readProcessList() throws -> [AudioObjectID] {
     try requireSystemObject()
@@ -72,23 +63,6 @@ extension AudioObjectID {
     return value
   }
 
-  /// Reads `kAudioHardwarePropertyTranslatePIDToProcessObject` for the specific pid, should only be called on the system object.
-  func translatePIDToProcessObjectID(pid: pid_t) throws -> AudioObjectID {
-    try requireSystemObject()
-
-    let processObject = try read(
-      kAudioHardwarePropertyTranslatePIDToProcessObject,
-      defaultValue: AudioObjectID.unknown,
-      qualifier: pid
-    )
-
-    guard processObject.isValid else {
-      throw CAError(message: "Invalid process identifier: \(pid)")
-    }
-
-    return processObject
-  }
-
   /// Reads the value for `kAudioHardwarePropertyDefaultSystemOutputDevice`, should only be called on the system object.
   func readDefaultSystemOutputDevice() throws -> AudioDeviceID {
     try requireSystemObject()
@@ -113,18 +87,6 @@ extension AudioObjectID {
 // MARK: - Generic Property Access
 
 extension AudioObjectID {
-  func read<T, Q>(
-    _ selector: AudioObjectPropertySelector,
-    scope: AudioObjectPropertyScope = kAudioObjectPropertyScopeGlobal,
-    element: AudioObjectPropertyElement = kAudioObjectPropertyElementMain,
-    defaultValue: T,
-    qualifier: Q
-  ) throws -> T {
-    try read(
-      AudioObjectPropertyAddress(mSelector: selector, mScope: scope, mElement: element),
-      defaultValue: defaultValue, qualifier: qualifier)
-  }
-
   func read<T>(
     _ selector: AudioObjectPropertySelector,
     scope: AudioObjectPropertyScope = kAudioObjectPropertyScopeGlobal,
@@ -134,17 +96,6 @@ extension AudioObjectID {
     try read(
       AudioObjectPropertyAddress(mSelector: selector, mScope: scope, mElement: element),
       defaultValue: defaultValue)
-  }
-
-  func read<T, Q>(_ address: AudioObjectPropertyAddress, defaultValue: T, qualifier: Q) throws -> T
-  {
-    var inQualifier = qualifier
-    let qualifierSize = UInt32(MemoryLayout<Q>.size(ofValue: qualifier))
-    return try withUnsafeMutablePointer(to: &inQualifier) { qualifierPtr in
-      try read(
-        address, defaultValue: defaultValue, inQualifierSize: qualifierSize,
-        inQualifierData: qualifierPtr)
-    }
   }
 
   func read<T>(_ address: AudioObjectPropertyAddress, defaultValue: T) throws -> T {

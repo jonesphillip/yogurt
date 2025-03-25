@@ -2,6 +2,7 @@ import AVFoundation
 import AudioToolbox
 import Foundation
 import OSLog
+import Observation
 
 @Observable
 final class MicrophoneRecorder {
@@ -11,14 +12,15 @@ final class MicrophoneRecorder {
   private let flushInterval: TimeInterval = 5.0
   private var lastFlushTime = Date()
   private var pendingBuffer = Data()
-  private var currentFile: AVAudioFile?
 
   private(set) var isRunning = false
 
-  // Helper for writing integers in little-endian
-  private func writeLE<T: FixedWidthInteger>(_ value: T) -> [UInt8] {
-    withUnsafeBytes(of: value.littleEndian) { Array($0) }
-  }
+  // Observable amplitude in [0...1].
+  var amplitude: Float = 0.0
+
+  // Throttling amplitude updates
+  private var lastAmplitudeUpdate = Date()
+  private let amplitudeUpdateInterval: TimeInterval = 0.1
 
   func start(chunkHandler: @escaping (Data) -> Void) throws {
     guard !isRunning else { return }
@@ -26,97 +28,74 @@ final class MicrophoneRecorder {
     self.chunkHandler = chunkHandler
 
     let engine = AVAudioEngine()
-    let input = engine.inputNode
-    let inputFormat = input.inputFormat(forBus: 0)
+    let inputNode = engine.inputNode
+    let inputFormat = inputNode.inputFormat(forBus: 0)
 
-    // Create format converter node
     let converter = AVAudioMixerNode()
     engine.attach(converter)
+    engine.connect(inputNode, to: converter, format: inputFormat)
 
-    // Connect with input format, then get output in desired format
-    engine.connect(input, to: converter, format: inputFormat)
+    // We want 16kHz, mono, 16-bit for transcription
+    let desiredFormat = AVAudioFormat(
+      commonFormat: .pcmFormatInt16,
+      sampleRate: 16000,
+      channels: 1,
+      interleaved: true
+    )!
 
-    // Create file settings for 16kHz, mono, 16-bit
-    let settings: [String: Any] = [
-      AVFormatIDKey: kAudioFormatLinearPCM,
-      AVSampleRateKey: 16000.0,
-      AVNumberOfChannelsKey: 1,
-      AVLinearPCMBitDepthKey: 16,
-      AVLinearPCMIsFloatKey: false,
-      AVLinearPCMIsNonInterleaved: false,
-    ]
+    converter.installTap(onBus: 0, bufferSize: 4096, format: inputFormat) { [weak self] buffer, _ in
+      guard let strongSelf = self else { return }
 
-    // Install tap using input format
-    converter.installTap(onBus: 0, bufferSize: 4096, format: inputFormat) {
-      [weak self] buffer, time in
-      guard let self = self else { return }
-
-      // Create resampler
-      let outputFormat = AVAudioFormat(
-        commonFormat: .pcmFormatInt16,
-        sampleRate: 16000,
-        channels: 1,
-        interleaved: true)!
-
-      guard let converter = AVAudioConverter(from: buffer.format, to: outputFormat) else {
-        self.logger.error("Failed to create converter")
+      // Use AVAudioConverter from buffer.format → desiredFormat
+      guard let converter = AVAudioConverter(from: buffer.format, to: desiredFormat) else {
+        strongSelf.logger.error("Could not create AVAudioConverter")
         return
       }
-
       let ratio = 16000.0 / buffer.format.sampleRate
-      let outputFrameCapacity = AVAudioFrameCount(Double(buffer.frameLength) * ratio)
+      let outFrames = AVAudioFrameCount(Double(buffer.frameLength) * ratio)
 
-      guard
-        let outputBuffer = AVAudioPCMBuffer(
-          pcmFormat: outputFormat,
-          frameCapacity: outputFrameCapacity)
+      guard let outputBuffer = AVAudioPCMBuffer(pcmFormat: desiredFormat, frameCapacity: outFrames)
       else {
-        self.logger.error("Failed to create output buffer")
+        strongSelf.logger.error("Could not create output buffer")
         return
       }
 
       var error: NSError?
-      let inputBlock: AVAudioConverterInputBlock = { inNumPackets, outStatus in
+      let inputBlock: AVAudioConverterInputBlock = { _, outStatus in
         outStatus.pointee = .haveData
         return buffer
       }
-
       converter.convert(to: outputBuffer, error: &error, withInputFrom: inputBlock)
-
-      if let error = error {
-        self.logger.error("Conversion error: \(error.localizedDescription)")
+      if let e = error {
+        strongSelf.logger.error("Conversion error: \(e.localizedDescription)")
         return
       }
 
-      // Create 8-bit data for streaming
       let frameCount = Int(outputBuffer.frameLength)
-      var audioData = Data(capacity: frameCount)
+      guard let int16Ptr = outputBuffer.int16ChannelData?[0] else { return }
 
-      if let samples = outputBuffer.int16ChannelData?[0] {
-        for frame in 0..<frameCount {
-          let sample = samples[frame]
-          let normalized = Float(sample) / Float(Int16.max)
-          let mapped = UInt8(max(0, min(255, (normalized + 1.0) * 128)))
-          audioData.append(mapped)
-        }
+      let newAmp = AudioCaptureUtils.computeRMSAmplitude(
+        int16Samples: int16Ptr,
+        frameCount: frameCount
+      )
+      strongSelf.throttleAmplitudeUpdate(newAmp)
 
-        // Accumulate into pending buffer
-        self.pendingBuffer.append(audioData)
+      let samples = Array(UnsafeBufferPointer(start: int16Ptr, count: frameCount))
+      let int16Data = AudioCaptureUtils.int16ArrayToData(samples)
+      strongSelf.pendingBuffer.append(int16Data)
 
-        // Flush every flushInterval
-        let now = Date()
-        if now.timeIntervalSince(self.lastFlushTime) >= self.flushInterval {
-          let wavData = self.makeWavDataFromPendingBuffer(
-            self.pendingBuffer,
-            sampleRate: 16000,
-            channels: 1
-          )
-
-          self.chunkHandler?(wavData)
-
-          self.pendingBuffer.removeAll()
-          self.lastFlushTime = now
-        }
+      // Flush chunk at set intervals
+      let now = Date()
+      if now.timeIntervalSince(strongSelf.lastFlushTime) >= strongSelf.flushInterval {
+        let wavData = AudioCaptureUtils.makeWavData(
+          pcmData: strongSelf.pendingBuffer,
+          sampleRate: 16000,
+          channels: 1,
+          bitsPerSample: 16
+        )
+        strongSelf.chunkHandler?(wavData)
+        strongSelf.pendingBuffer.removeAll()
+        strongSelf.lastFlushTime = now
       }
     }
 
@@ -130,18 +109,18 @@ final class MicrophoneRecorder {
   func stop() {
     guard isRunning else { return }
 
-    // Final flush if needed
-    if !pendingBuffer.isEmpty, let format = engine?.inputNode.inputFormat(forBus: 0) {
-      let wavData = makeWavDataFromPendingBuffer(
-        pendingBuffer,
-        sampleRate: format.sampleRate,
-        channels: UInt32(format.channelCount)
+    // Final flush
+    if !pendingBuffer.isEmpty {
+      let wavData = AudioCaptureUtils.makeWavData(
+        pcmData: pendingBuffer,
+        sampleRate: 16000,
+        channels: 1,
+        bitsPerSample: 16
       )
       chunkHandler?(wavData)
       pendingBuffer.removeAll()
     }
 
-    currentFile = nil
     engine?.inputNode.removeTap(onBus: 0)
     engine?.stop()
     engine = nil
@@ -149,41 +128,13 @@ final class MicrophoneRecorder {
     logger.info("Microphone recording stopped")
   }
 
-  // Creates WAV data from raw PCM samples
-  private func makeWavDataFromPendingBuffer(
-    _ pcmData: Data,
-    sampleRate: Float64,
-    channels: UInt32
-  ) -> Data {
-    let bitsPerSample: UInt16 = 8
-    let blockAlign = UInt16(channels) * bitsPerSample / 8
-    let byteRate = UInt32(sampleRate) * UInt32(blockAlign)
-
-    let subchunk2Size = UInt32(pcmData.count)
-    let chunkSize = 36 + subchunk2Size
-
-    var wav = Data()
-
-    // "RIFF" header
-    wav.append(contentsOf: "RIFF".utf8)
-    wav.append(contentsOf: writeLE(chunkSize))
-    wav.append(contentsOf: "WAVE".utf8)
-
-    // "fmt " chunk
-    wav.append(contentsOf: "fmt ".utf8)
-    wav.append(contentsOf: writeLE(UInt32(16)))  // PCM
-    wav.append(contentsOf: writeLE(UInt16(1)))  // PCM format
-    wav.append(contentsOf: writeLE(UInt16(channels)))  // Channels
-    wav.append(contentsOf: writeLE(UInt32(sampleRate)))  // Sample rate
-    wav.append(contentsOf: writeLE(byteRate))  // Byte rate
-    wav.append(contentsOf: writeLE(blockAlign))  // Block align
-    wav.append(contentsOf: writeLE(bitsPerSample))  // Bits per sample
-
-    // "data" chunk
-    wav.append(contentsOf: "data".utf8)
-    wav.append(contentsOf: writeLE(subchunk2Size))
-    wav.append(pcmData)
-
-    return wav
+  private func throttleAmplitudeUpdate(_ newAmp: Float) {
+    let now = Date()
+    if now.timeIntervalSince(lastAmplitudeUpdate) > amplitudeUpdateInterval {
+      Task { @MainActor in
+        self.amplitude = newAmp
+      }
+      lastAmplitudeUpdate = now
+    }
   }
 }

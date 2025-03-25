@@ -157,7 +157,6 @@ class MarkdownTextView: NSTextView, NSTextViewDelegate {
     isRichText = true
     isEditable = true
     isSelectable = true
-    isAutomaticLinkDetectionEnabled = true
     allowsUndo = true
     isAutomaticQuoteSubstitutionEnabled = true
     isAutomaticLinkDetectionEnabled = true
